@@ -34,6 +34,34 @@ Then open in your browser:
 
 ---
 
+## Verify it works (after clone or pull)
+
+Run these from the **repo root** to confirm everything works:
+
+```bash
+# Clone (if starting fresh)
+git clone https://github.com/Adi0224/Drone2.git
+cd Drone2
+
+# Setup
+python3 -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
+pip install -r backend/requirements.txt
+python scripts/download_model.py   # first time only (~12 MB)
+
+# Run
+PHANTOM_HTTP_ONLY=1 python backend/main.py
+```
+
+You should see: `Starting server on http://localhost:8000`. Then:
+
+1. Open **http://localhost:8000** — tactical map and webcam feed should load.
+2. Open **http://localhost:8000/live** — live stream with YOLO boxes.
+
+If both load, the app is working. Stop the server with `Ctrl+C`.
+
+---
+
 ## Quick Start (Mac — with built-in webcam)
 
 On Mac the app uses your **built-in webcam** by default. YOLO runs on CPU.
