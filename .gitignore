@@ -13,6 +13,9 @@ ssl/*.pem
 .DS_Store
 *.log
 
+# Runtime databases
+chroma_db/
+
 # Models (download with scripts/download_model.py)
 models/*.onnx
 models/*.pt
