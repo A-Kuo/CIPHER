@@ -22,11 +22,12 @@ This guide is for running YOLO on the **Qualcomm Hexagon NPU (45 TOPS)** on Wind
 ⚠️ **CRITICAL:** You MUST use AMD64 (x64) Python, NOT ARM64 Python on Windows.
 
 ```powershell
-# Download Python 3.11 or 3.12 (AMD64 version)
-# https://www.python.org/downloads/windows/
+# Download Python 3.12.0 (AMD64 version) — this repo uses 3.12.0 only
+# https://www.python.org/downloads/release/python-3120/
 
-# Verify it's AMD64:
+# Verify version and architecture:
 python --version
+# Must show: Python 3.12.0
 python -c "import platform; print(platform.machine())"
 # Should output: AMD64 (not ARM64)
 ```
@@ -243,7 +244,7 @@ The NPU will process frames in real-time at 60-120 FPS.
 ## ✅ Quick Checklist
 
 - [ ] Windows 11 Copilot+ PC with Snapdragon X Elite/Plus
-- [ ] Python 3.11/3.12 (AMD64, not ARM64)
+- [ ] Python 3.12.0 (AMD64, not ARM64)
 - [ ] `qai_hub_models` installed
 - [ ] Graph API running on port 8001
 - [ ] NPU showing usage in Task Manager
