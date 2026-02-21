@@ -1,0 +1,155 @@
+"""
+YOLOv8 1-class crack segmentation detector (ONNX).
+
+Same API as backend.perception YOLODetector/YOLOSegDetector:
+  detect(frame) -> [{"class", "confidence", "bbox", "center"}, ...]
+"""
+
+import logging
+from pathlib import Path
+
+import cv2
+import numpy as np
+
+logger = logging.getLogger(__name__)
+
+CRACK_CLASS_NAME = "crack"
+
+
+class YOLOCrackSegDetector:
+    """
+    YOLOv8 1-class segmentation (e.g. OpenSistemas/YOLOv8-crack-seg) via ONNX Runtime.
+    Same API as YOLOSegDetector: detect() returns [{"class", "confidence", "bbox", "center"}, ...].
+    Use for drone environmental detection (cracks, damage). Merge with main YOLO detections in backend.
+    """
+
+    def __init__(
+        self,
+        model_path: str,
+        qnn_dll_path: str | None = None,
+        confidence_threshold: float = 0.45,
+        class_name: str = CRACK_CLASS_NAME,
+    ):
+        import onnxruntime as ort
+
+        self.model_path = model_path
+        self._last_latency_ms: float = 0.0
+        self._input_size = 640
+        self._conf_threshold = confidence_threshold
+        self._class_name = class_name
+
+        path = Path(model_path)
+        if not path.is_absolute():
+            for base in [Path.cwd(), Path.cwd().parent, _get_repo_root()]:
+                if base is None:
+                    continue
+                candidate = base / model_path
+                if candidate.exists():
+                    model_path = str(candidate)
+                    break
+
+        prov_list = []
+        if qnn_dll_path and Path(qnn_dll_path).exists():
+            prov_list.append(("QNNExecutionProvider", {"backend_path": qnn_dll_path}))
+        prov_list.append("CPUExecutionProvider")
+        try:
+            self._session = ort.InferenceSession(model_path, providers=prov_list)
+        except Exception as e:
+            logger.warning(f"QNN failed: {e}, using CPU only")
+            self._session = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
+
+        active = self._session.get_providers()
+        if "QNNExecutionProvider" not in active:
+            logger.warning("\033[91m Crack-seg NPU not in use — CPU only.\033[0m")
+        self._input_name = self._session.get_inputs()[0].name
+        self._num_classes = 1  # crack-seg
+
+    def preprocess(self, frame: np.ndarray) -> np.ndarray:
+        img = cv2.resize(frame, (self._input_size, self._input_size))
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        img = img.astype(np.float32) / 255.0
+        img = img.transpose(2, 0, 1)
+        img = np.expand_dims(img, axis=0)
+        return img
+
+    def detect(self, frame: np.ndarray) -> list[dict]:
+        """Same format as YOLODetector/YOLOSegDetector: [{"class", "confidence", "bbox", "center"}, ...]."""
+        import time
+
+        h_orig, w_orig = frame.shape[:2]
+        inp = self.preprocess(frame)
+        start = time.perf_counter()
+        out = self._session.run(None, {self._input_name: inp})
+        self._last_latency_ms = (time.perf_counter() - start) * 1000
+
+        raw = out[0]
+        if raw.ndim == 3:
+            raw = raw[0]
+        raw = np.transpose(raw, (1, 0))
+        num_cols = raw.shape[1]
+        num_classes = max(1, num_cols - 4 - 32)
+        scale_x = w_orig / self._input_size
+        scale_y = h_orig / self._input_size
+
+        detections = []
+        for i in range(raw.shape[0]):
+            cx, cy, w, h = raw[i, :4]
+            probs = raw[i, 4 : 4 + num_classes]
+            class_id = int(np.argmax(probs))
+            confidence = float(probs[class_id])
+            if confidence < self._conf_threshold:
+                continue
+            cx_s = cx * scale_x
+            cy_s = cy * scale_y
+            w_s = w * scale_x
+            h_s = h * scale_y
+            x1 = cx_s - w_s / 2
+            y1 = cy_s - h_s / 2
+            x2 = cx_s + w_s / 2
+            y2 = cy_s + h_s / 2
+            detections.append({
+                "class": self._class_name,
+                "confidence": confidence,
+                "bbox": [float(x1), float(y1), float(x2), float(y2)],
+                "center": [float(cx_s), float(cy_s)],
+            })
+
+        detections = self._nms(detections, iou_threshold=0.5)
+        return detections
+
+    def _nms(self, detections: list[dict], iou_threshold: float = 0.45) -> list[dict]:
+        if not detections:
+            return []
+        boxes = np.array([d["bbox"] for d in detections])
+        scores = np.array([d["confidence"] for d in detections])
+        x1, y1, x2, y2 = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
+        area = (x2 - x1) * (y2 - y1)
+        order = scores.argsort()[::-1]
+        keep = []
+        while order.size > 0:
+            i = order[0]
+            keep.append(i)
+            if order.size == 1:
+                break
+            xx1 = np.maximum(x1[i], x1[order[1:]])
+            yy1 = np.maximum(y1[i], y1[order[1:]])
+            xx2 = np.minimum(x2[i], x2[order[1:]])
+            yy2 = np.minimum(y2[i], y2[order[1:]])
+            inter = np.maximum(0, xx2 - xx1) * np.maximum(0, yy2 - yy1)
+            iou = inter / (area[i] + area[order[1:]] - inter)
+            order = order[1:][iou <= iou_threshold]
+        return [detections[j] for j in keep]
+
+    def get_provider(self) -> str:
+        return self._session.get_providers()[0]
+
+    def get_last_latency(self) -> float:
+        return self._last_latency_ms
+
+
+def _get_repo_root() -> Path | None:
+    """Repo root = parent of crack_detection package."""
+    try:
+        return Path(__file__).resolve().parent.parent
+    except Exception:
+        return None

@@ -1,0 +1,10 @@
+# CIPHER / PHANTOM CODE — Repository-level Python version pin.
+# All tooling and venvs for this repo should use Python 3.12.0 only.
+# See also: .python-version (pyenv / uv).
+
+[project]
+name = "cipher"
+version = "0.1.0"
+description = "On-device AI tactical drone copilot (Qualcomm NPU, YOLO, LLM)."
+readme = "README.md"
+requires-python = "==3.12.0"

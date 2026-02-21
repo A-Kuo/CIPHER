@@ -3,6 +3,7 @@
 # ============================================================
 
 import platform
+from pathlib import Path
 
 # --- Mac vs Windows ---
 # When no IP camera URL is set, use built-in laptop webcam (index 0) on all platforms.
@@ -58,10 +59,29 @@ YOLO_ONNX_PATH = "models/yolov8_det.onnx"
 YOLO_CONFIDENCE_THRESHOLD = 0.45
 YOLO_INPUT_SIZE = 640  # YOLOv8 expects 640x640
 
+# --- YOLO Segmentation (optional) ---
+# When set and file exists, backend can use YOLOSegDetector for masks + detections.
+# Export with: python scripts/download_model_qualcomm_seg.py
+YOLO_SEG_ONNX_PATH = "models/yolov8_seg.onnx"
+
+# --- YOLO Crack Segmentation (drone environmental detection) ---
+# OpenSistemas/YOLOv8-crack-seg: road/wall crack segmentation. Download: python scripts/download_model_crack_seg.py
+# When set and file exists, crack detections are merged with main YOLO detections (class "crack").
+# Toggle via env (no code change): YOLO_CRACK_ENABLED=0 to disable, YOLO_CRACK_ENABLED=1 or unset to use file/config.
+YOLO_CRACK_SEG_ONNX_PATH = _os.environ.get("YOLO_CRACK_SEG_ONNX_PATH", "models/yolov8_crack_seg.onnx")
+_crack_enabled_env = _os.environ.get("YOLO_CRACK_ENABLED", "").strip().lower()
+YOLO_CRACK_ENABLED = _crack_enabled_env not in ("0", "false", "no") if _crack_enabled_env else True
+YOLO_CRACK_CONFIDENCE_THRESHOLD = float(_os.environ.get("YOLO_CRACK_CONFIDENCE_THRESHOLD", "0.35"))
+
 # --- NPU ---
-# Update this path after checking the laptop. Run: dir C:\Qualcomm
-# Browse to: C:\Qualcomm\AIStack\QAIRT\<version>\lib\arm64x-windows-msvc\
-QNN_DLL_PATH = r"C:\Qualcomm\AIStack\QAIRT\2.26.0.240828\lib\arm64x-windows-msvc\QnnHtp.dll"
+# Windows + Qualcomm only. On ARM/Linux leave unset or set to None; CPU fallback is used.
+# Update path after checking the machine, e.g. C:\Qualcomm\AIStack\QAIRT\<version>\lib\arm64x-windows-msvc\QnnHtp.dll
+_qnn_default = None
+if platform.system() == "Windows":
+    _qnn_default = r"C:\Qualcomm\AIStack\QAIRT\2.26.0.240828\lib\arm64x-windows-msvc\QnnHtp.dll"
+QNN_DLL_PATH = _os.environ.get("QNN_DLL_PATH", _qnn_default)
+if QNN_DLL_PATH and not Path(QNN_DLL_PATH).exists():
+    QNN_DLL_PATH = None  # avoid ONNX Runtime failing to load missing DLL
 
 # --- LLM ---
 LLM_MODEL = "phi3:mini"

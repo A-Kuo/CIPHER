@@ -32,7 +32,7 @@ exclude = [
     "**/node_modules",
     "**/__pycache__",
 ]
-pythonVersion = "3.9"
+pythonVersion = "3.12"
 
 [tool.pytest.ini_options]
 minversion = "6.0"
@@ -56,4 +56,4 @@ extend-exclude = [
     "third_party",
 ]
 src = ["depth_pro", "tests"]
-target-version = "py39"
+target-version = "py312"

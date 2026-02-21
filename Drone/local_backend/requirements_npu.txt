@@ -20,6 +20,8 @@ ultralytics>=8.3.0
 # NOTE: Only works on Windows with AMD64 Python (not ARM64 Python)
 # Install separately: pip install qai_hub_models
 # Then: pip install "qai_hub_models[yolov8]"
+# For segmentation: pip install "qai_hub_models[yolov8_seg]"
+# See QUALCOMM_EXPORT.md for paste-able export commands.
 # qai_hub_models>=0.12.0
 
 # ONNX Runtime with QNN (alternative NPU backend)
