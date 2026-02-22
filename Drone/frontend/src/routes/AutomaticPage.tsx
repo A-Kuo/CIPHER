@@ -157,8 +157,8 @@ export function AutomaticPage() {
       const by = contentY + y1 * scaleY;
       const bw = (x2 - x1) * scaleX;
       const bh = (y2 - y1) * scaleY;
-      const distStr = det.distance_meters != null ? ` · ${Math.round(det.distance_meters * 100)}cm` : "";
-      const label = `${det.class} ${(det.confidence * 100).toFixed(0)}%${distStr}`;
+      const distStr = det.distance_meters != null ? ` · ${Math.round(det.distance_meters * 100 / 25)}` : "";
+      const label = `${det.class}${distStr}`;
       ctx.strokeStyle = getSemanticClassColor(det.class);
       ctx.lineWidth = 3;
       ctx.strokeRect(bx, by, bw, bh);

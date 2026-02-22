@@ -417,6 +417,7 @@ phantom_state = {
     "last_llm_time": 0.0,
     "yolo_error": None,  # set if Drone YOLO load or run fails
     "yolo_enabled": False,  # OFF by default — frontend START AI enables it
+    "recording": False,     # True while START AI is on — clip is written and auto-imported on STOP AI
     "agent_response": {"answer": "", "node_ids": [], "ts": 0.0},  # tactical query (voice/text) for Agent tab
 }
 
@@ -466,6 +467,10 @@ _simple_capture = None
 _simple_camera_frame = None  # BGR numpy array, updated by background task
 _simple_camera_jpeg = None   # bytes for /api/feed/.../processed
 _placeholder_jpeg = None     # "Camera starting..." placeholder to avoid 503 flicker
+
+# Recording clip for Agent: START AI starts, STOP AI ends and auto-imports
+_recording_writer = None
+_recording_path: Optional[str] = None
 
 # Depth Anything V2 estimator (loaded at startup if model file exists)
 _depth_estimator = None
@@ -588,10 +593,8 @@ def _draw_yolo_and_depth_on_frame(cv2_module, frame, detections: List[Dict]):
                 continue
             x1, y1, x2, y2 = int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
             label = d.get("class", "?")
-            conf = d.get("confidence", 0)
             if d.get("distance_meters") is not None:
-                label += f" {int(d['distance_meters'] * 100)}cm"
-            label += f" {conf*100:.0f}%"
+                label += f" {int(d['distance_meters'] * 100 / 25)}"
             cv2_module.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
             (tw, th), _ = cv2_module.getTextSize(label, cv2_module.FONT_HERSHEY_SIMPLEX, 0.5, 1)
             cv2_module.rectangle(frame, (x1, y1 - th - 8), (x1 + tw + 4, y1), (0, 0, 255), -1)
@@ -626,7 +629,8 @@ async def _simple_camera_loop():
 
 
 async def _display_loop():
-    """Output feed at a steady 30 FPS (smooth like Zoom). Uses latest camera frame + latest YOLO/depth detections."""
+    """Output feed at a steady 30 FPS (smooth like Zoom). Uses latest camera frame + latest YOLO/depth detections. When recording, writes vis to clip for Agent import."""
+    global _recording_writer, _recording_path
     import cv2
     while True:
         await asyncio.sleep(0.033)
@@ -640,6 +644,13 @@ async def _display_loop():
             jpeg_bytes = jpeg.tobytes()
             phantom_state["processed_frames"]["Drone-1"] = jpeg_bytes
             phantom_state["processed_frames"]["Drone-2"] = jpeg_bytes
+            if phantom_state.get("recording") and _recording_path:
+                if _recording_writer is None:
+                    h, w = vis.shape[:2]
+                    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                    _recording_writer = cv2.VideoWriter(_recording_path, fourcc, 30.0, (w, h))
+                if _recording_writer is not None:
+                    _recording_writer.write(vis)
         except Exception:
             pass
 
@@ -697,7 +708,46 @@ async def phantom_background_loop():
                     phantom_state["detections"][drone_id] = []
                     continue
                 try:
-                    if phantom_yolo_detector is not None:
+                    h, w = frame.shape[:2]
+                    loop = asyncio.get_event_loop()
+                    # Run YOLO and Depth in parallel on NPU to maximize utilization
+                    if phantom_yolo_detector is not None and _depth_estimator is not None and _depth_estimator.loaded:
+                        def _run_yolo():
+                            try:
+                                return phantom_yolo_detector.detect(frame), None
+                            except Exception as e1:
+                                return [], e1
+                        def _run_depth():
+                            try:
+                                t0 = time.time()
+                                out = _depth_estimator.infer(frame)
+                                return out, (time.time() - t0) * 1000
+                            except Exception:
+                                return None, 0.0
+                        (detections, yolo_err), (depth_map, depth_latency_ms) = await asyncio.gather(
+                            loop.run_in_executor(None, _run_yolo),
+                            loop.run_in_executor(None, _run_depth),
+                        )
+                        phantom_state["depth_latency_ms"] = depth_latency_ms
+                        if yolo_err and phantom_yolo_detector is not None:
+                            try:
+                                detections = phantom_yolo_detector.detect(frame)
+                                _npu_fail_count = 0
+                            except Exception:
+                                _npu_fail_count = phantom_state.get("_npu_fail_count", 0) + 1
+                                phantom_state["_npu_fail_count"] = _npu_fail_count
+                                detections = []
+                        else:
+                            _npu_fail_count = 0
+                        if phantom_yolo_detector is not None and detections is not None:
+                            phantom_state["npu_provider"] = phantom_yolo_detector.get_provider()
+                            phantom_state["yolo_latency_ms"] = phantom_yolo_detector.get_last_latency()
+                        if depth_map is not None:
+                            for d in detections:
+                                d["distance_meters"] = _depth_estimator.depth_at_bbox(
+                                    depth_map, d.get("bbox", [0, 0, 1, 1]), w, h
+                                )
+                    elif phantom_yolo_detector is not None:
                         try:
                             detections = phantom_yolo_detector.detect(frame)
                             _npu_fail_count = 0
@@ -720,25 +770,32 @@ async def phantom_background_loop():
                         if phantom_yolo_detector is not None and detections is not None:
                             phantom_state["npu_provider"] = phantom_yolo_detector.get_provider()
                             phantom_state["yolo_latency_ms"] = phantom_yolo_detector.get_last_latency()
+                        if _depth_estimator is not None and _depth_estimator.loaded:
+                            try:
+                                t_d = time.time()
+                                depth_map = _depth_estimator.infer(frame)
+                                phantom_state["depth_latency_ms"] = (time.time() - t_d) * 1000
+                                if depth_map is not None:
+                                    for d in detections:
+                                        d["distance_meters"] = _depth_estimator.depth_at_bbox(
+                                            depth_map, d.get("bbox", [0, 0, 1, 1]), w, h
+                                        )
+                            except Exception:
+                                pass
                     else:
-                        # Fallback: Drone's YOLO (CPU) when Drone2 ONNX not loaded
                         detections = _run_drone_yolo_on_frame(frame)
-                    # Clear error when we successfully get detections (e.g. ONNX working)
+                        if _depth_estimator is not None and _depth_estimator.loaded:
+                            try:
+                                depth_map = _depth_estimator.infer(frame)
+                                if depth_map is not None:
+                                    for d in detections:
+                                        d["distance_meters"] = _depth_estimator.depth_at_bbox(
+                                            depth_map, d.get("bbox", [0, 0, 1, 1]), w, h
+                                        )
+                            except Exception:
+                                pass
+                    # Clear error when we successfully get detections
                     phantom_state["yolo_error"] = None
-                    h, w = frame.shape[:2]
-                    # Depth Anything (Qualcomm AI Hub or HuggingFace) — attach distance_meters for minimap
-                    if _depth_estimator is not None and _depth_estimator.loaded:
-                        try:
-                            t_d = time.time()
-                            depth_map = _depth_estimator.infer(frame)
-                            phantom_state["depth_latency_ms"] = (time.time() - t_d) * 1000
-                            if depth_map is not None:
-                                for d in detections:
-                                    d["distance_meters"] = _depth_estimator.depth_at_bbox(
-                                        depth_map, d.get("bbox", [0, 0, 1, 1]), w, h
-                                    )
-                        except Exception:
-                            pass
                     mapped = p["detection_mapper"].map_detections(drone_id, detections, w, h)
                     phantom_state["detections"][drone_id] = mapped
                     if drone_id == "Drone-1":
@@ -976,12 +1033,21 @@ async def startup_event():
             _yolo_path = _phantom_model_path_fast
             _yolo_input_size = 320
     if _phantom and _yolo_path.exists():
+        p = _phantom
+        cfg = p["config"]
+        qnn_path = getattr(cfg, "QNN_DLL_PATH", None)
+        if not qnn_path:
+            try:
+                from backend.ort_providers import resolve_qnn_backend_path
+                qnn_path = resolve_qnn_backend_path(None)
+                if qnn_path:
+                    print(f"  NPU: using QnnHtp.dll at {qnn_path[:60]}...")
+            except Exception:
+                pass
         try:
-            p = _phantom
-            cfg = p["config"]
             phantom_yolo_detector = p["YOLODetector"](
                 str(_yolo_path),
-                qnn_dll_path=getattr(cfg, "QNN_DLL_PATH", None),
+                qnn_dll_path=qnn_path,
                 confidence_threshold=getattr(cfg, "YOLO_CONFIDENCE_THRESHOLD", 0.45),
                 input_size=_yolo_input_size,
                 use_gpu=getattr(cfg, "USE_GPU", True),
@@ -991,7 +1057,11 @@ async def startup_event():
             phantom_state["npu_provider"] = phantom_yolo_detector.get_provider()
             phantom_state["yolo_error"] = None
             asyncio.create_task(phantom_background_loop())
-            print(f"  Drone2 YOLO: loaded {_yolo_input_size}x{_yolo_input_size} (on laptop feed)")
+            prov = phantom_yolo_detector.get_provider()
+            if "QNN" in str(prov):
+                print(f"  Drone2 YOLO: loaded on NPU ({_yolo_input_size}x{_yolo_input_size})")
+            else:
+                print(f"  Drone2 YOLO: loaded {_yolo_input_size}x{_yolo_input_size} (on laptop feed)")
         except Exception as e:
             print(f"  Drone2 YOLO: not loaded ({e})")
             phantom_yolo_detector = None
@@ -1403,15 +1473,29 @@ def api_status():
 
 @app.post("/api/yolo/start")
 def api_yolo_start():
+    global _recording_path, _recording_writer
     phantom_state["yolo_enabled"] = True
-    return {"yolo_enabled": True}
+    phantom_state["recording"] = True
+    _recording_writer = None
+    import tempfile
+    _recording_path = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4", prefix="manual_clip_").name
+    return {"yolo_enabled": True, "recording": True}
 
 
 @app.post("/api/yolo/stop")
 def api_yolo_stop():
+    global _recording_writer, _recording_path
     phantom_state["yolo_enabled"] = False
+    phantom_state["recording"] = False
     phantom_state["raw_detections"] = []
     phantom_state["detections"] = {}
+    if _recording_writer is not None and _recording_path:
+        try:
+            _recording_writer.release()
+        except Exception:
+            pass
+    _recording_writer = None
+    _recording_path = None
     return {"yolo_enabled": False}
 
 
@@ -1576,17 +1660,27 @@ async def _run_voice_query_with_text(text: str):
     spatial_answer = ""
     spatial_node_ids = []
     wg = _get_world_graph()
-    # Run detection-based search for any object-style question when we have at least one node with frames
-    if wg is not None and getattr(wg, "nodes", None) and len(wg.nodes) >= 1:
+    q = text.lower()
+    # Procedural questions (how to respond, what to do) → RAG/manuals only; do not use spatial
+    procedural_triggers = (
+        "how to", "how do i", "how can i", "what should", "what to do", "how do we",
+        "respond to", "procedure", "procedures", "steps for", "guide", "handle ",
+        "deal with", "extinguish", "evacuate", "treat ", "assess ", "classify",
+    )
+    is_procedural = any(t in q for t in procedural_triggers)
+    # Run detection-based search only for location-seeking questions when we have nodes with frames
+    if wg is not None and getattr(wg, "nodes", None) and len(wg.nodes) >= 1 and not is_procedural:
         nodes_with_frames = sum(1 for n in wg.nodes.values() if getattr(n, "image_b64", None))
-        q = text.lower()
         spatial_triggers = (
             "where", "find", "locate", "show me", "in the feed", "spot", "which node", "which nodes",
             "which frame", "which frames", "which image", "which images", "which instance", "which instances",
             "see the", "saw the", "was the", "seen", "detected", "extinguisher", "person", "exit", "door",
-            "fire", "hazard", "bottle", "cup", "chair", "table", "object", "cell phone", "book", "laptop",
+            "bottle", "cup", "chair", "table", "object", "cell phone", "book", "laptop",
         )
-        if nodes_with_frames >= 1 and (any(t in q for t in spatial_triggers) or any(w in q for w in ("node", "frame", "image", "instance"))):
+        # "fire" and "hazard" only as spatial when combined with location intent (where/find/which node)
+        location_intent = any(x in q for x in ("where", "find", "locate", "show me", "which node", "which frame", "spot", "in the feed"))
+        object_word = any(t in q for t in spatial_triggers) or any(w in q for w in ("node", "frame", "image", "instance"))
+        if nodes_with_frames >= 1 and (object_word or (location_intent and ("fire" in q or "hazard" in q))):
             def _spatial_search():
                 try:
                     from clip_navigator import (
@@ -1633,14 +1727,41 @@ async def _run_voice_query_with_text(text: str):
         agent_used = "SPATIAL"
         confidence = 0.9
     else:
-        def _run():
-            get_graph_callback = _world_graph.get_graph if _world_graph else None
-            return query_agent(text, top_k=3, get_graph_callback=get_graph_callback)
-        result = await asyncio.get_event_loop().run_in_executor(None, _run)
-        answer = result.get("answer", "")
-        node_ids = list(result.get("node_ids", []))
-        confidence = float(result.get("confidence", 0.75))
-        recommended_action = (result.get("recommended_action") or "").strip()
+        # Safety companion: when user asked where exit/door/safety and we found nothing in footage, give RAG guidance
+        q = text.lower()
+        has_footage = wg is not None and getattr(wg, "nodes", None) and len(wg.nodes) >= 1
+        safety_location_asked = (
+            has_footage
+            and any(phrase in q for phrase in ("exit", "door", "way out", "escape", "safety", "safe", "get out"))
+        )
+        if safety_location_asked:
+            def _safety_companion_run():
+                get_graph_callback = _world_graph.get_graph if _world_graph else None
+                rag_result = query_agent(
+                    "What should I do when I cannot find an exit or door? How do I stay safe and get out?",
+                    top_k=4,
+                    get_graph_callback=get_graph_callback,
+                )
+                return rag_result.get("answer", "").strip()
+            try:
+                safety_guidance = await asyncio.get_event_loop().run_in_executor(None, _safety_companion_run)
+                if safety_guidance:
+                    answer = (
+                        "No exit or door detected in your footage. As your AI safety companion, here's what to do next: "
+                        + safety_guidance
+                    )
+                    confidence = 0.85
+            except Exception:
+                pass
+        if not answer:
+            def _run():
+                get_graph_callback = _world_graph.get_graph if _world_graph else None
+                return query_agent(text, top_k=3, get_graph_callback=get_graph_callback)
+            result = await asyncio.get_event_loop().run_in_executor(None, _run)
+            answer = result.get("answer", "")
+            node_ids = list(result.get("node_ids", []))
+            confidence = float(result.get("confidence", 0.75))
+            recommended_action = (result.get("recommended_action") or "").strip()
     phantom_state["agent_response"] = {
         "answer": answer, "node_ids": node_ids, "text": text, "ts": time.time(),
         "confidence": confidence, "agent_used": agent_used, "recommended_action": recommended_action,

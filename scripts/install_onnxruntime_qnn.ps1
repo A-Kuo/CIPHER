@@ -68,12 +68,17 @@ if ($LASTEXITCODE -ne 0) {
 Write-Host ""
 Write-Host "Verifying QNN provider..." -ForegroundColor Yellow
 & $pythonExe -c "
-import onnxruntime as ort
-p = ort.get_available_providers()
-if 'QNNExecutionProvider' in p:
-    print('  OK: QNNExecutionProvider available. YOLO/Depth will use NPU.')
-else:
-    print('  WARNING: QNN not in providers:', p)
+try:
+    import onnxruntime as ort
+    p = getattr(ort, 'get_available_providers', lambda: [])()
+    if 'QNNExecutionProvider' in p:
+        print('  OK: QNNExecutionProvider available. YOLO/Depth will use NPU.')
+    else:
+        print('  Providers:', list(p) if p else '(none)')
+        if not p:
+            print('  If backend still uses CPU, ensure no other onnxruntime is installed and restart the backend.')
+except Exception as ex:
+    print('  Check failed:', ex)
 "
 Write-Host ""
 Write-Host "Done. Restart the backend (run_drone_full.ps1) so YOLO and Depth use the NPU." -ForegroundColor Green

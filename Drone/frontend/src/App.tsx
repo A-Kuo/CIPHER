@@ -18,6 +18,7 @@ export function App() {
   const navigate = useNavigate();
   const isLanding = location.pathname === "/";
   const [importStatus, setImportStatus] = useState<ImportStatus | null>(null);
+  const [videoOn, setVideoOn] = useState(true);
 
   useEffect(() => {
     if (isLanding) return;
@@ -59,7 +60,7 @@ export function App() {
       <main className="page-content">
         <Routes>
           <Route path="/" element={<LandingPage />} />
-          <Route path="/manual" element={<ManualPage />} />
+          <Route path="/manual" element={<ManualPage videoOn={videoOn} setVideoOn={setVideoOn} />} />
           <Route path="/automatic" element={<AutomaticPage />} />
           <Route path="/agent/:sessionId" element={<AgentPage />} />
           <Route path="/agent" element={<AgentPage />} />

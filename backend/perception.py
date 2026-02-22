@@ -66,9 +66,13 @@ class YOLODetector:
         prov_list = yolo_providers(
             available, qnn_dll_path, use_gpu, split_npu_gpu, prefer_npu_over_gpu
         )
-        # Retry NPU/GPU session creation a few times before falling back to CPU (avoids one-off init failures)
+        if "QNNExecutionProvider" in str(prov_list):
+            from backend.ort_providers import resolve_qnn_backend_path
+            _path = resolve_qnn_backend_path(qnn_dll_path)
+            logger.info("YOLO: attempting NPU (QNN) backend_path=%s", _path or "(default)")
+        # Retry NPU session creation — Qualcomm NPU can need a moment to init
         last_err = None
-        for attempt in range(3):
+        for attempt in range(4):
             try:
                 self._session = ort.InferenceSession(
                     model_path, sess_options=sess_opts, providers=prov_list
@@ -77,11 +81,14 @@ class YOLODetector:
                 break
             except Exception as e:
                 last_err = e
-                if attempt < 2 and "QNNExecutionProvider" in str(prov_list):
+                if attempt < 3 and "QNNExecutionProvider" in str(prov_list):
                     import time
-                    time.sleep(0.5 * (attempt + 1))  # brief wait before retry
+                    time.sleep(1.0 * (attempt + 1))  # give NPU time to init
                     continue
-                logger.warning(f"NPU/GPU failed (attempt {attempt + 1}): {e}, using CPU only")
+                logger.warning(
+                    "NPU/GPU failed (attempt %d): %s — using CPU. Check QnnHtp.dll path in config.",
+                    attempt + 1, e
+                )
                 self._session = ort.InferenceSession(
                     model_path, sess_options=sess_opts, providers=["CPUExecutionProvider"]
                 )

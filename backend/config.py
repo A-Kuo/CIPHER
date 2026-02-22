@@ -66,8 +66,9 @@ YOLO_INPUT_SIZE = 640  # Used when loading 640 model; 320 when loading fast mode
 PREFER_NPU_OVER_GPU = True  # YOLO and Depth use NPU first (faster); do not set False
 USE_GPU = True  # Fallback when NPU unavailable
 SPLIT_NPU_GPU = False  # Keep False so YOLO and Depth both use NPU
-# QNN backend DLL — leave None to auto-detect (onnxruntime-qnn bundles it, or set path if needed)
-QNN_DLL_PATH = None  # e.g. r"C:\Qualcomm\AIStack\QAIRT\...\QnnHtp.dll" if auto-detect fails
+# QNN backend DLL — leave None to auto-detect (onnxruntime-qnn bundles it in capi/QnnHtp.dll)
+# If YOLO stays on CPU, set to full path to QnnHtp.dll, e.g. <Python site-packages>/onnxruntime/capi/QnnHtp.dll
+QNN_DLL_PATH = None  # If None, backend auto-resolves QnnHtp.dll at startup (Qualcomm AIStack / ort package).
 
 # --- LLM ---
 LLM_MODEL = "phi3:mini"

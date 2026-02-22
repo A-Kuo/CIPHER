@@ -32,27 +32,52 @@ def get_available_providers():
 
 def resolve_qnn_backend_path(config_path: str | None) -> str | None:
     """
-    Resolve path to QnnHtp.dll for NPU. Tries config path, then DLL bundled with
-    onnxruntime-qnn (capi/ or lib/), then Qualcomm AIStack. Returns None if not found.
+    Resolve path to QnnHtp.dll for NPU. On Qualcomm laptops we need this for NPU usage.
+    Tries: config path, Qualcomm AIStack, onnxruntime-qnn package (capi/), then rglob.
     """
     if config_path and Path(config_path).exists():
         return config_path
     try:
-        import onnxruntime as ort
-        ort_root = Path(ort.__file__).resolve().parent
-        # onnxruntime-qnn 1.18+: often in capi/ or lib/
-        for subdir in ("capi", "lib", "."):
-            for name in ("QnnHtp.dll", "QnnHtp.so", "libQnnHtp.so"):
-                p = (ort_root / subdir / name) if subdir != "." else (ort_root / name)
+        import os
+        # 1) Qualcomm AIStack — standard on Snapdragon X Elite / Qualcomm dev machines
+        for qairt in (
+            os.environ.get("QAIRT_PATH"),
+            r"C:\Qualcomm\AIStack\QAIRT",
+            os.path.expandvars(r"%ProgramFiles%\Qualcomm\AIStack\QAIRT"),
+        ):
+            if not qairt:
+                continue
+            base = Path(qairt)
+            if not base.exists():
+                continue
+            # Try versioned subdirs (e.g. 2.22.0) then lib
+            for libdir in ("lib/arm64x-windows-msvc", "lib/x86_64-windows-msvc", "lib"):
+                p = base / libdir / "QnnHtp.dll"
                 if p.exists():
                     return str(p)
-        # Windows Snapdragon: Qualcomm AIStack (optional)
-        import os
-        qairt = os.environ.get("QAIRT_PATH", r"C:\Qualcomm\AIStack\QAIRT")
-        for libdir in ("lib", "lib/arm64x-windows-msvc", "lib/x86_64-windows-msvc"):
-            p = Path(qairt) / libdir / "QnnHtp.dll"
-            if p.exists():
-                return str(p)
+            for sub in base.iterdir():
+                if sub.is_dir():
+                    for libdir in ("lib/arm64x-windows-msvc", "lib/x86_64-windows-msvc", "lib"):
+                        p = sub / libdir / "QnnHtp.dll"
+                        if p.exists():
+                            return str(p)
+        # 2) onnxruntime-qnn package (capi/QnnHtp.dll)
+        import onnxruntime as ort
+        ort_root = Path(ort.__file__).resolve().parent if getattr(ort, "__file__", None) else None
+        if ort_root is None:
+            for _p in getattr(ort, "__path__", []) or []:
+                ort_root = Path(_p)
+                break
+        if ort_root and ort_root.exists():
+            for subdir in ("capi", "lib", "."):
+                for name in ("QnnHtp.dll", "QnnHtp.so", "libQnnHtp.so"):
+                    p = (ort_root / subdir / name) if subdir != "." else (ort_root / name)
+                    if p.exists():
+                        return str(p)
+            for dll in ort_root.rglob("QnnHtp.dll"):
+                return str(dll)
+            for so in ort_root.rglob("libQnnHtp.so"):
+                return str(so)
     except Exception:
         pass
     return None
@@ -88,12 +113,11 @@ def build_providers(
 
 
 def _qnn_provider_options(backend_path: str | None) -> Dict[str, str]:
-    """Build QNN EP options so HTP (NPU) compute is used and Task Manager shows NPU Compute, not just Shared Memory."""
-    opts = dict(QNN_HTP_OPTIONS)
+    """Build QNN EP options. Prefer minimal options for max compatibility on Qualcomm NPU."""
     if backend_path:
-        opts["backend_path"] = backend_path
-        opts.pop("backend_type", None)  # backend_path and backend_type are mutually exclusive
-    return opts
+        # Explicit path: use it; avoid conflicting options (backend_path vs backend_type)
+        return {"backend_path": backend_path, "htp_performance_mode": "high_performance"}
+    return dict(QNN_HTP_OPTIONS)
 
 
 def yolo_providers(
@@ -104,28 +128,23 @@ def yolo_providers(
     prefer_npu_over_gpu: bool = True,
 ) -> List[Any]:
     """
-    Providers for YOLO. When prefer_npu_over_gpu: [QNN, CPU] so NPU is used.
-    When split_npu_gpu and not prefer_npu: YOLO→NPU, Depth→GPU.
+    Providers for YOLO. When prefer_npu_over_gpu: try NPU first (by DLL path), then CPU.
+    On Qualcomm laptops we ALWAYS try QNN when QnnHtp.dll is found — do not gate on get_available_providers().
     """
-    if prefer_npu_over_gpu and "QNNExecutionProvider" in available:
-        # Force HTP (NPU) so Task Manager shows NPU Compute
-        resolved = resolve_qnn_backend_path(qnn_dll_path)
-        opts = _qnn_provider_options(resolved)
-        try:
-            return [("QNNExecutionProvider", opts), "CPUExecutionProvider"]
-        except Exception:
-            if resolved:
-                return [("QNNExecutionProvider", {"backend_path": resolved}), "CPUExecutionProvider"]
-            try:
-                return [("QNNExecutionProvider", {"backend_type": "htp"}), "CPUExecutionProvider"]
-            except Exception:
-                pass
     if prefer_npu_over_gpu:
+        resolved = resolve_qnn_backend_path(qnn_dll_path)
+        if resolved:
+            # Force NPU: we have the DLL, use it. Session creation will fall back to CPU if it fails.
+            opts = _qnn_provider_options(resolved)
+            return [("QNNExecutionProvider", opts), "CPUExecutionProvider"]
+        if "QNNExecutionProvider" in available:
+            opts = _qnn_provider_options(resolved)
+            return [("QNNExecutionProvider", opts), "CPUExecutionProvider"]
         return ["CPUExecutionProvider"]
     if split_npu_gpu and use_gpu:
         resolved = resolve_qnn_backend_path(qnn_dll_path)
         prov = []
-        if "QNNExecutionProvider" in available:
+        if resolved or "QNNExecutionProvider" in available:
             prov.append(("QNNExecutionProvider", _qnn_provider_options(resolved)))
         prov.append("CPUExecutionProvider")
         return prov
@@ -140,21 +159,18 @@ def depth_providers(
     prefer_npu_over_gpu: bool = True,
 ) -> List[Any]:
     """
-    Providers for Depth. When prefer_npu_over_gpu: [QNN, CPU] so Depth runs on NPU (HTP) too.
+    Providers for Depth. When prefer_npu_over_gpu: try NPU first (by DLL path), then CPU.
+    On Qualcomm laptops we ALWAYS try QNN when QnnHtp.dll is found.
     """
-    if prefer_npu_over_gpu and "QNNExecutionProvider" in available:
-        resolved = resolve_qnn_backend_path(qnn_dll_path)
-        opts = _qnn_provider_options(resolved)
-        try:
-            return [("QNNExecutionProvider", opts), "CPUExecutionProvider"]
-        except Exception:
-            if resolved:
-                return [("QNNExecutionProvider", {"backend_path": resolved}), "CPUExecutionProvider"]
-            try:
-                return [("QNNExecutionProvider", {"backend_type": "htp"}), "CPUExecutionProvider"]
-            except Exception:
-                pass
     if prefer_npu_over_gpu:
+        resolved = resolve_qnn_backend_path(qnn_dll_path)
+        if resolved:
+            opts = _qnn_provider_options(resolved)
+            return [("QNNExecutionProvider", opts), "CPUExecutionProvider"]
+        if "QNNExecutionProvider" in available:
+            resolved = resolve_qnn_backend_path(qnn_dll_path)
+            opts = _qnn_provider_options(resolved)
+            return [("QNNExecutionProvider", opts), "CPUExecutionProvider"]
         return ["CPUExecutionProvider"]
     if split_npu_gpu and use_gpu:
         prov = []
