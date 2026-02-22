@@ -43,12 +43,15 @@ export function AgentPage() {
   const [, setRecommendedAction] = useState("");
   const [conversationHistory, setConversationHistory] = useState<ConversationEntry[]>([]);
   const [agentStatus, setAgentStatus] = useState<"ready" | "initializing">("initializing");
-  const [, setNodeThumbnails] = useState<Record<string, string>>({});
+  const [nodeThumbnails, setNodeThumbnails] = useState<Record<string, string>>({});
+  const [uploadedNodeIds, setUploadedNodeIds] = useState<string[]>([]);
   type CurrentNode = { node_id: string; image_b64: string | null; detections: Array<{ class_name: string; confidence: number }>; structural_risk_score: number } | null;
   const [currentNode, setCurrentNode] = useState<CurrentNode>(null);
   const [vOverlayOn, setVOverlayOn] = useState(false);
   const [importStatus, setImportStatus] = useState<{ status: string; current: number; total: number; message: string; nodes_added?: number } | null>(null);
+  const [uploadedVideoThumbnail, setUploadedVideoThumbnail] = useState<string | null>(null);
   const videoImportInputRef = useRef<HTMLInputElement>(null);
+  const [graphRefreshKey, setGraphRefreshKey] = useState(0);
 
   // Agent status: AGENT READY / AGENT INITIALIZING
   useEffect(() => {
@@ -90,7 +93,7 @@ export function AgentPage() {
     return () => clearInterval(t);
   }, [importStatus?.status]);
 
-  // Fetch graph: thumbnails + current node (first of agentNodeIds or first in graph)
+  // Fetch graph: thumbnails + current node. Prefer frames from uploaded video (source=imported), not manual/live footage.
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -99,18 +102,33 @@ export function AgentPage() {
         const r = await fetch(`${base}/api/graph_3d`);
         const data = await r.json().catch(() => ({}));
         if (cancelled) return;
-        const nodes: Array<{ node_id?: string; image_b64?: string | null; detections?: Array<{ class_name: string; confidence: number }>; structural_risk_score?: number }> = data.nodes || [];
+        const nodes: Array<{ node_id?: string; image_b64?: string | null; source?: string; detections?: Array<{ class_name: string; confidence: number }>; structural_risk_score?: number }> = data.nodes || [];
+        const importedNodes = nodes.filter((n) => n.source === "imported");
+        const displayNodes = importedNodes.length > 0 ? importedNodes : nodes;
+        const orderIds = displayNodes.map((n) => n.node_id).filter((id): id is string => Boolean(id));
+        setUploadedNodeIds(orderIds);
         const map: Record<string, string> = {};
+        for (const n of importedNodes) {
+          if (n.node_id && n.image_b64) map[n.node_id] = `data:image/jpeg;base64,${n.image_b64}`;
+        }
         for (const n of nodes) {
           const id = n.node_id;
           const b64 = n.image_b64;
-          if (id && b64 && (agentNodeIds.length === 0 || agentNodeIds.includes(id))) {
+          if (id && b64 && (agentNodeIds.length === 0 || agentNodeIds.includes(id)) && !map[id]) {
             map[id] = `data:image/jpeg;base64,${b64}`;
           }
         }
         setNodeThumbnails(map);
-        const pickId = agentNodeIds.length > 0 ? agentNodeIds[0] : nodes[0]?.node_id;
-        const full = nodes.find((n) => n.node_id === pickId) ?? nodes[0];
+        const firstImported = importedNodes[0];
+        if (importedNodes.length === 0) {
+          setUploadedVideoThumbnail(null);
+        } else if (firstImported?.image_b64) {
+          setUploadedVideoThumbnail(`data:image/jpeg;base64,${firstImported.image_b64}`);
+        }
+        const pickId = agentNodeIds.length > 0
+          ? (agentNodeIds.find((id) => displayNodes.some((n) => n.node_id === id)) ?? displayNodes[0]?.node_id)
+          : displayNodes[0]?.node_id;
+        const full = nodes.find((n) => n.node_id === pickId) ?? displayNodes[0];
         if (full?.node_id) {
           setCurrentNode({
             node_id: full.node_id,
@@ -127,7 +145,7 @@ export function AgentPage() {
       }
     })();
     return () => { cancelled = true; };
-  }, [agentNodeIds.join(",")]);
+  }, [agentNodeIds.join(","), graphRefreshKey]);
 
   // Auto-join session from URL on mount
   useEffect(() => {
@@ -268,6 +286,9 @@ export function AgentPage() {
     const file = e.target.files?.[0];
     e.target.value = "";
     if (!file) return;
+    setUploadedVideoThumbnail(null);
+    setUploadedNodeIds([]);
+    setCurrentNode(null);
     setImportStatus({ status: "running", current: 0, total: 0, message: "Uploading..." });
     try {
       const base = agentApiBase();
@@ -321,10 +342,10 @@ export function AgentPage() {
       </div>
 
       <div style={{ flex: 1, minHeight: 0, display: "flex" }}>
-        {/* Left 65%: current node frame (no boxes), detection pill bottom-left, structural risk bottom-right, V overlay */}
+        {/* Left 65%: show frame only after user adds video (file upload) and import completes — no preloaded thumbnail */}
         <div style={{ flex: "0 0 65%", minWidth: 0, position: "relative", background: "#000", display: "flex", flexDirection: "column" }}>
           <div style={{ flex: 1, position: "relative", minHeight: 0 }}>
-            {currentNode?.image_b64 ? (
+            {(importStatus?.status === "complete" && currentNode?.image_b64) ? (
               <div style={{ width: "100%", height: "100%", position: "relative" }}>
                 <img
                   src={`data:image/jpeg;base64,${currentNode.image_b64}`}
@@ -346,21 +367,21 @@ export function AgentPage() {
                     }}
                   />
                 )}
+                {currentNode.detections?.length > 0 && (
+                  <div style={{ position: "absolute", bottom: 8, left: 8, background: "rgba(0,0,0,0.75)", color: "#fff", padding: "0.3rem 0.6rem", borderRadius: 6, fontSize: "0.75rem" }}>
+                    {currentNode.detections.map((d) => d.class_name).join(" · ")}
+                  </div>
+                )}
+                {currentNode.structural_risk_score > 0 && (
+                  <div style={{ position: "absolute", bottom: 8, right: 8, background: "rgba(255,136,0,0.85)", color: "#000", padding: "0.3rem 0.6rem", borderRadius: 6, fontSize: "0.75rem", fontWeight: 600 }}>
+                    Structural risk
+                  </div>
+                )}
               </div>
             ) : (
               <div style={{ width: "100%", height: "100%", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", color: "rgba(255,255,255,0.5)", padding: "2rem", textAlign: "center" }}>
                 <p style={{ marginBottom: "0.5rem" }}>Add a video (right panel), then ask questions about it.</p>
                 <p style={{ fontSize: "0.85rem" }}>e.g. &quot;Where is the fire extinguisher?&quot; or &quot;Find the exit&quot;</p>
-              </div>
-            )}
-            {currentNode && currentNode.detections?.length > 0 && (
-              <div style={{ position: "absolute", bottom: 8, left: 8, background: "rgba(0,0,0,0.75)", color: "#fff", padding: "0.3rem 0.6rem", borderRadius: 6, fontSize: "0.75rem" }}>
-                {currentNode.detections.map((d) => `${d.class_name} ${Math.round(d.confidence * 100)}%`).join(" · ")}
-              </div>
-            )}
-            {currentNode && currentNode.structural_risk_score > 0 && (
-              <div style={{ position: "absolute", bottom: 8, right: 8, background: "rgba(255,136,0,0.85)", color: "#000", padding: "0.3rem 0.6rem", borderRadius: 6, fontSize: "0.75rem", fontWeight: 600 }}>
-                Structural risk
               </div>
             )}
           </div>
@@ -377,21 +398,59 @@ export function AgentPage() {
           {showQueryForm && (
             <div style={{ padding: "0.5rem", borderBottom: "1px solid rgba(255,255,255,0.1)" }}>
               <div style={{ marginBottom: 8 }}>
-                <span style={{ fontSize: "0.75rem", color: "rgba(255,255,255,0.8)", marginRight: 8 }}>1. Add video</span>
-                <input ref={videoImportInputRef} type="file" accept=".mp4,.avi,.mov,.mkv,.webm" style={{ display: "none" }} onChange={onVideoImportFileChange} />
-                <button type="button" className="replay-btn" onClick={onAddRecordedVideo} disabled={importStatus?.status === "running"}>
-                  {importStatus?.status === "running" ? "Importing…" : "Add video"}
-                </button>
+                <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                  <span style={{ fontSize: "0.75rem", color: "rgba(255,255,255,0.8)", marginRight: 4 }}>1. Add video</span>
+                  <input ref={videoImportInputRef} type="file" accept=".mp4,.avi,.mov,.mkv,.webm" style={{ display: "none" }} onChange={onVideoImportFileChange} />
+                  <button type="button" className="replay-btn" onClick={onAddRecordedVideo} disabled={importStatus?.status === "running"}>
+                    {importStatus?.status === "running" ? "Importing…" : "Add video"}
+                  </button>
+                </div>
+                {uploadedVideoThumbnail && (
+                  <div style={{ marginTop: 8, padding: 6, background: "rgba(255,255,255,0.06)", borderRadius: 6, border: "1px solid rgba(255,255,255,0.12)" }}>
+                    <div style={{ fontSize: "0.7rem", color: "rgba(255,255,255,0.7)", marginBottom: 4 }}>Your video</div>
+                    <img
+                      src={uploadedVideoThumbnail}
+                      alt="Uploaded video"
+                      style={{ width: "100%", maxWidth: 160, height: 90, objectFit: "cover", borderRadius: 4, display: "block" }}
+                    />
+                    {uploadedNodeIds.length > 1 && (
+                      <div style={{ display: "flex", gap: 4, marginTop: 6, flexWrap: "wrap" }}>
+                        {uploadedNodeIds.slice(0, 5).map((id) => (
+                          <button
+                            key={id}
+                            type="button"
+                            onClick={() => setAgentNodeIds([id])}
+                            style={{
+                              padding: 0,
+                              border: currentNode?.node_id === id ? "2px solid #3388ff" : "1px solid rgba(255,255,255,0.2)",
+                              borderRadius: 4,
+                              overflow: "hidden",
+                              background: "none",
+                              cursor: "pointer",
+                              flex: "0 0 auto",
+                            }}
+                          >
+                            {nodeThumbnails[id] ? (
+                              <img src={nodeThumbnails[id]} alt="" style={{ width: 40, height: 28, objectFit: "cover", display: "block" }} />
+                            ) : (
+                              <div style={{ width: 40, height: 28, background: "rgba(255,255,255,0.1)" }} />
+                            )}
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
                 {importStatus?.status === "running" && (
-                  <span style={{ fontSize: "0.7rem", color: "rgba(255,255,255,0.7)", marginLeft: 6 }}>{importStatus.message}</span>
+                  <span style={{ fontSize: "0.7rem", color: "#3388ff", marginLeft: 0, display: "block", marginTop: 4 }}>{importStatus.message}</span>
                 )}
                 {importStatus?.status === "complete" && (
-                  <span style={{ fontSize: "0.75rem", color: "#6f6", marginLeft: 6 }}>
-                    Ready ({(importStatus.nodes_added ?? 0)} nodes). Ask below.
+                  <span style={{ fontSize: "0.75rem", color: "#6f6", marginLeft: 0, display: "block", marginTop: 4 }}>
+                    Ready ({(importStatus.nodes_added ?? 0)} frames). Ask below.
                   </span>
                 )}
                 {importStatus?.status === "error" && (
-                  <span style={{ fontSize: "0.75rem", color: "#f88", marginLeft: 6 }}>{importStatus.message}</span>
+                  <span style={{ fontSize: "0.75rem", color: "#f88", marginLeft: 0, display: "block", marginTop: 4 }}>{importStatus.message}</span>
                 )}
               </div>
               <div style={{ fontSize: "0.75rem", color: "rgba(255,255,255,0.7)", marginBottom: 6 }}>2. Ask a question about your video (type or voice)</div>
