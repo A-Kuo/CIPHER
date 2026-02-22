@@ -3,12 +3,13 @@ import { Route, Routes, useLocation, useNavigate } from "react-router-dom";
 import { LandingPage } from "./routes/LandingPage";
 import { AgentPage } from "./routes/AgentPage";
 import { ManualPage } from "./routes/ManualPage";
+import { AutomaticPage } from "./routes/AutomaticPage";
 import { ReplayPage } from "./routes/ReplayPage";
 import { Map3DPage } from "./routes/Map3DPage";
 import { ModeSwitch } from "./components/ModeSwitch";
 import { API_BASE_URL } from "./config";
 
-const TAB_ROUTES = ["/agent", "/manual", "/replay", "/3d-map"] as const;
+const TAB_ROUTES = ["/agent", "/manual", "/automatic", "/replay"] as const;
 
 type ImportStatus = { status: string; current: number; total: number; message: string; nodes_added?: number };
 
@@ -59,6 +60,7 @@ export function App() {
         <Routes>
           <Route path="/" element={<LandingPage />} />
           <Route path="/manual" element={<ManualPage />} />
+          <Route path="/automatic" element={<AutomaticPage />} />
           <Route path="/agent/:sessionId" element={<AgentPage />} />
           <Route path="/agent" element={<AgentPage />} />
           <Route path="/replay" element={<ReplayPage />} />

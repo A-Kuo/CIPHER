@@ -83,11 +83,11 @@ export function ManualPage() {
     };
   }, [USE_BACKEND_FEED, MAIN_BACKEND, backendReachable]);
 
-  // Backend feed tick: only when backend is reachable to avoid connection refused spam
+  // Feed tick: refresh at ~30 FPS to match backend (smooth like Zoom)
   const [feedTick, setFeedTick] = useState(0);
   useEffect(() => {
     if (!USE_BACKEND_FEED || backendReachable !== true) return;
-    const t = setInterval(() => setFeedTick((n) => n + 1), 100);
+    const t = setInterval(() => setFeedTick((n) => n + 1), 33);
     return () => clearInterval(t);
   }, [backendReachable]);
 
@@ -110,8 +110,10 @@ export function ManualPage() {
     return () => clearInterval(t);
   }, [backendReachable]);
 
-  // Draw YOLO boxes on canvas overlay (useLayoutEffect runs before paint — no flicker gap)
+  // Overlay only when not using backend stream (stream already has YOLO + depth drawn on server)
+  const useOverlay = !USE_BACKEND_FEED || backendReachable !== true;
   useLayoutEffect(() => {
+    if (!useOverlay) return;
     const img = imgRef.current;
     const canvas = canvasRef.current;
     if (!canvas || !img) return;
@@ -127,7 +129,6 @@ export function ManualPage() {
 
     detections.forEach((det) => {
       const [x1, y1, x2, y2] = det.bbox;
-      // bbox is in pixels from YOLO — scale to canvas size
       const scaleX = canvas.width / (img.naturalWidth || canvas.width);
       const scaleY = canvas.height / (img.naturalHeight || canvas.height);
       const bx = x1 * scaleX;
@@ -138,29 +139,28 @@ export function ManualPage() {
       const distStr = det.distance_meters != null ? ` · ${Math.round(det.distance_meters * 100)}cm` : "";
       const label = `${det.class}${distStr}`;
 
-      // Box
       ctx.strokeStyle = "#FF3000";
       ctx.lineWidth = 2;
       ctx.strokeRect(bx, by, bw, bh);
 
-      // Label background
       ctx.font = "bold 13px Inter, sans-serif";
       const textW = ctx.measureText(label).width + 8;
       ctx.fillStyle = "#FF3000";
       ctx.fillRect(bx, by - 20, textW, 20);
 
-      // Label text
       ctx.fillStyle = "#fff";
       ctx.fillText(label, bx + 4, by - 5);
     });
-  }, [detections, feedTick]);
+  }, [useOverlay, detections]);
 
-  // SSE connection to /live_detections
+  // Real-time: enable YOLO + depth on backend, open SSE for detections, stream is already MJPEG at /api/feed/Drone-1/stream
   const startDetections = useCallback(() => {
     if (sseRef.current) {
       sseRef.current.close();
     }
     setAiStatus("connecting");
+    // Tell backend to run YOLO + depth so the MJPEG stream shows boxes and distance
+    fetch(`${MAIN_BACKEND}/api/yolo/start`, { method: "POST" }).catch(() => {});
     const url = `${MAIN_BACKEND}/live_detections?run_llama=false`;
     const sse = new EventSource(url);
     sseRef.current = sse;
@@ -183,6 +183,7 @@ export function ManualPage() {
   }, []);
 
   const stopDetections = useCallback(() => {
+    fetch(`${MAIN_BACKEND}/api/yolo/stop`, { method: "POST" }).catch(() => {});
     sseRef.current?.close();
     sseRef.current = null;
     setDetections([]);
@@ -302,7 +303,7 @@ export function ManualPage() {
                     ? BACKEND_DOWN_PLACEHOLDER
                     : IPHONE_STREAM_URL
               }
-              alt="Camera Feed"
+              alt="Live camera (YOLO + depth)"
               style={{ background: "#000", width: "100%", height: "100%", objectFit: "contain" }}
               onError={() => {}}
             />
@@ -346,7 +347,7 @@ export function ManualPage() {
           </div>
         </div>
 
-        {/* Right 35%: semantic map (detections in camera view) + detection list */}
+        {/* Right 35%: semantic map + detection list */}
         <div style={{ flex: "0 0 35%", minWidth: 0, display: "flex", flexDirection: "column", gap: "0.5rem" }}>
           <span className="ai-panel-label">SEMANTIC MAP</span>
           <div style={{ flex: 1, minHeight: 120, background: "#0a0f19", borderRadius: 4, border: "1px solid rgba(255,255,255,0.1)", overflow: "hidden" }}>
