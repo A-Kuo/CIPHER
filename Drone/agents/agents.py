@@ -1,9 +1,15 @@
-"""Drone vision agents: parallel building exploration with vision LLM.
+"""Drone vision agents: parallel building exploration and video analysis.
+
+Supports two modes:
+  1. **Exploration** — parallel agents navigate a 3D space using VLM
+     to find objects described by the user's natural-language query.
+  2. **Video Analysis** — agentic frame-by-frame analysis of the user's
+     video feed, using tokenized NL queries to produce structured findings.
 
 Usage:
     modal deploy agents/agents.py
 
-Requires app.py to be deployed first (provides the GetImage class).
+Requires app.py to be deployed first (provides the ImageServer class).
 """
 
 import base64
@@ -14,6 +20,8 @@ import uuid
 
 import modal
 from starlette.responses import StreamingResponse, Response
+
+from query_parser import parse_query
 
 # ---------------------------------------------------------------------------
 # Model registry – add new vision-language models here
@@ -812,6 +820,202 @@ def stream_agents(request: dict):
 @modal.fastapi_endpoint(method="OPTIONS")
 def stream_agents_options():
     """Handle CORS preflight requests for the streaming endpoint."""
+    return Response(
+        content="",
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "POST, OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type",
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# Unified query endpoint — routes between exploration and video analysis
+# ---------------------------------------------------------------------------
+
+_EXPLORE_INTENTS = frozenset({"OBJECT_SEARCH", "SPATIAL_REASON"})
+_ANALYZE_INTENTS = frozenset({
+    "SCENE_DESCRIBE", "ACTION_DETECT", "TEMPORAL_TRACK",
+    "COUNT", "SAFETY_ASSESS", "OPEN_QUERY",
+})
+
+
+def _classify_mode(query: str) -> str:
+    """Decide whether a query is better served by exploration or analysis.
+
+    Returns "explore" or "analyze".
+    """
+    parsed = parse_query(query)
+    if not parsed.tokens:
+        return "analyze"
+
+    primary = parsed.primary_intent
+    if primary in _EXPLORE_INTENTS:
+        return "explore"
+    if primary in _ANALYZE_INTENTS:
+        return "analyze"
+    return "analyze"
+
+
+@vision_app.function(image=agent_image, timeout=900)
+@modal.fastapi_endpoint(method="POST")
+def query_video(request: dict):
+    """Unified NL query endpoint for user video feed analysis.
+
+    Accepts a natural-language query and automatically routes to either
+    the exploration agent (for spatial/object-search queries) or the
+    video analyzer (for scene description, counting, temporal queries, etc.).
+
+    Request body:
+        {
+            "query": "where is the fire extinguisher?",
+            "mode": "auto" | "explore" | "analyze",  // optional, default auto
+            "num_agents": 2,           // for explore mode
+            "max_frames": 20,          // for analyze mode
+            "start_x": 0, "start_y": 0, "start_z": 0, "start_yaw": 0
+        }
+
+    Returns SSE stream with events from either mode.
+    """
+    query = request.get("query", "")
+    mode = request.get("mode", "auto")
+    if mode == "auto":
+        mode = _classify_mode(query)
+
+    parsed = parse_query(query)
+
+    def event_gen():
+        yield f"data: {json.dumps({'type': 'query_parsed', 'mode': mode, 'parsed': parsed.to_dict()})}\n\n"
+
+        if mode == "explore":
+            yield from _run_explore_stream(request, query)
+        else:
+            yield from _run_analyze_stream(request, query)
+
+    return StreamingResponse(
+        event_gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "POST, OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type",
+        },
+    )
+
+
+def _run_explore_stream(request: dict, query: str):
+    """Delegate to exploration agents and yield their SSE events."""
+    start_x = request.get("start_x", 0.0)
+    start_y = request.get("start_y", 0.0)
+    start_z = request.get("start_z", 0.0)
+    start_yaw = request.get("start_yaw", 0.0)
+    num_agents = request.get("num_agents", 2)
+
+    session_key = str(uuid.uuid4())
+    cancel_dict[session_key] = False
+
+    agent_configs = []
+    for i in range(num_agents):
+        agent_yaw = (start_yaw + (i % 2) * 180) % 360
+        agent_configs.append((i, agent_yaw))
+        event = {
+            "type": "agent_started",
+            "agent_id": i,
+            "start_pose": {"x": start_x, "y": start_y, "z": start_z, "yaw": agent_yaw},
+        }
+        yield f"data: {json.dumps(event)}\n\n"
+
+    runner = VisionAgent()
+    handles = []
+    for agent_id, agent_yaw in agent_configs:
+        h = runner.send_agent.spawn(
+            query=query,
+            start_x=start_x, start_y=start_y, start_z=start_z,
+            start_yaw=agent_yaw,
+            agent_id=agent_id,
+            session_key=session_key,
+        )
+        handles.append(h)
+
+    completed = [False] * num_agents
+    results = [None] * num_agents
+    winner = None
+
+    while not all(completed):
+        time.sleep(2)
+        for i, h in enumerate(handles):
+            if completed[i]:
+                continue
+            try:
+                r = h.get(timeout=0)
+            except TimeoutError:
+                continue
+            except Exception:
+                completed[i] = True
+                yield f"data: {json.dumps({'type': 'error', 'agent_id': i, 'message': 'Agent error'})}\n\n"
+                continue
+
+            completed[i] = True
+            results[i] = r
+
+            for step_data in r.get("trajectory", []):
+                step_event = {
+                    "type": "agent_step",
+                    "agent_id": i,
+                    "step": step_data["step"],
+                    "total_steps": MAX_STEPS,
+                    "pose": {"x": step_data["x"], "y": step_data["y"], "z": step_data["z"], "yaw": step_data["yaw"]},
+                    "image_b64": "",
+                    "reasoning": "",
+                    "action": "move",
+                }
+                yield f"data: {json.dumps(step_event)}\n\n"
+
+            if r["found"]:
+                found_event = {
+                    "type": "agent_found",
+                    "agent_id": i,
+                    "description": r["description"],
+                    "final_image_b64": r.get("final_image_b64", ""),
+                    "filename": r.get("filename", ""),
+                    "steps": r["steps"],
+                    "trajectory": r["trajectory"],
+                    "directions": r.get("directions", []),
+                }
+                yield f"data: {json.dumps(found_event)}\n\n"
+                if winner is None:
+                    winner = i
+                    cancel_dict[session_key] = True
+            else:
+                yield f"data: {json.dumps({'type': 'agent_done', 'agent_id': i, 'found': False, 'steps': r['steps'], 'trajectory': r['trajectory']})}\n\n"
+
+    yield f"data: {json.dumps({'type': 'session_complete', 'winner_agent_id': winner, 'description': results[winner]['description'] if winner is not None else 'No target found', 'filename': results[winner].get('filename', '') if winner is not None else '', 'directions': results[winner].get('directions', []) if winner is not None else []})}\n\n"
+
+    try:
+        del cancel_dict[session_key]
+    except KeyError:
+        pass
+
+
+def _run_analyze_stream(request: dict, query: str):
+    """Delegate to the video analyzer and yield its SSE events."""
+    from video_analyzer import VideoAnalyzer
+
+    max_frames = request.get("max_frames", 24)
+    analyzer = VideoAnalyzer()
+    for event in analyzer.analyze_streaming.remote_gen(
+        query=query, max_frames=max_frames,
+    ):
+        yield f"data: {json.dumps(event)}\n\n"
+
+
+@vision_app.function(image=agent_image)
+@modal.fastapi_endpoint(method="OPTIONS")
+def query_video_options():
+    """CORS preflight for the unified query endpoint."""
     return Response(
         content="",
         headers={

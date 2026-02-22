@@ -292,3 +292,75 @@ class ImageServer:
             "filename": src["filename"],
             "allowed": allowed,
         }
+
+    @modal.method()
+    def getFrameByIndex(self, index: int) -> dict:
+        """Return a specific frame by its database index.
+
+        Used by the video analyzer to access frames directly without
+        coordinate-based lookup.  Returns raw JPEG bytes + metadata.
+        """
+        if index < 0 or index >= len(self.db):
+            return {"error": f"Index {index} out of range (0–{len(self.db) - 1})"}
+        src = self.db[index]
+        return {
+            "image": src["jpeg"],
+            "x": src["x"],
+            "y": src["y"],
+            "z": src["z"],
+            "yaw": src["yaw"],
+            "filename": src["filename"],
+            "timestamp_s": src["t"],
+        }
+
+    @modal.method()
+    def getFrameCount(self) -> int:
+        """Return the total number of loaded frames."""
+        return len(self.db)
+
+    @modal.fastapi_endpoint()
+    def frame_metadata(self):
+        """Return metadata for all loaded frames (no image data).
+
+        Useful for the frontend and analyzer to understand the video
+        timeline and spatial coverage without transferring image bytes.
+        """
+        entries = []
+        for i, e in enumerate(self.db):
+            entries.append({
+                "index": i,
+                "timestamp_s": round(e["t"], 3),
+                "x": round(e["x"], 4),
+                "y": round(e["y"], 4),
+                "z": round(e["z"], 4),
+                "yaw": round(e["yaw"], 2),
+                "filename": e["filename"],
+            })
+        return {
+            "total_frames": len(self.db),
+            "frame_interval_s": FRAME_INTERVAL,
+            "frames": entries,
+        }
+
+    @modal.fastapi_endpoint()
+    def frame_by_index(self, index: int = 0):
+        """Return a single frame as base64 JPEG by its index.
+
+        Query: ?index=42
+        """
+        import base64
+
+        if index < 0 or index >= len(self.db):
+            return {"error": f"Index {index} out of range (0–{len(self.db) - 1})"}
+        src = self.db[index]
+        b64 = base64.b64encode(src["jpeg"]).decode("ascii")
+        return {
+            "image": b64,
+            "index": index,
+            "timestamp_s": round(src["t"], 3),
+            "x": round(src["x"], 4),
+            "y": round(src["y"], 4),
+            "z": round(src["z"], 4),
+            "yaw": round(src["yaw"], 2),
+            "filename": src["filename"],
+        }
