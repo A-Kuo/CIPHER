@@ -74,12 +74,17 @@ def run_analyze(
         fps = float(cap.get(cv2.CAP_PROP_FPS)) or 30.0
         job["total_frames"] = total_frames
         job["fps"] = fps
-        job["total"] = total_frames
-        job["message"] = f"Processing 0 / {total_frames}"
 
-        # Process every Nth frame: ~2 FPS analysis for speed (was ~5 FPS)
-        analysis_fps = 2.0
-        step = max(1, int(round(fps / analysis_fps)))
+        # Process at most MAX_PROCESSED frames so long videos finish in minutes, not 20+ mins
+        MAX_PROCESSED = 150
+        if total_frames <= MAX_PROCESSED:
+            step = 1
+            job["total"] = total_frames
+        else:
+            step = max(1, total_frames // MAX_PROCESSED)
+            job["total"] = min(total_frames, (total_frames + step - 1) // step)
+        job["message"] = f"Processing 0 / {job['total']} (every {step} frames)"
+
         detections_by_frame: List[List[Dict]] = []
         for fi in range(total_frames):
             detections_by_frame.append([])  # default empty
@@ -150,37 +155,37 @@ def run_analyze(
         depth_every_n = 3 if use_depth else 0
         processed_count = 0
 
-        frame_idx = 0
-        while True:
+        # Only read frames we actually process (seek instead of reading every frame)
+        frames_to_process = [i for i in range(0, total_frames, step)]
+        for i, frame_idx in enumerate(frames_to_process):
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
             ret, frame = cap.read()
-            if not ret:
+            if not ret or frame is None:
                 break
-            if frame_idx % step == 0:
-                dets = run_yolo(frame)
-                run_depth = (
-                    depth_estimator
-                    and depth_estimator.loaded
-                    and frame is not None
-                    and (depth_every_n <= 0 or (processed_count % depth_every_n) == 0)
-                )
-                if run_depth:
-                    try:
-                        h, w = frame.shape[:2]
-                        depth_map = depth_estimator.infer(frame)
-                        if depth_map is not None:
-                            for d in dets:
-                                d["distance_meters"] = depth_estimator.depth_at_bbox(
-                                    depth_map, d.get("bbox", [0, 0, 1, 1]), w, h
-                                )
-                    except Exception:
-                        pass
-                processed_count += 1
-                detections_by_frame[frame_idx] = dets
-                job["current"] = frame_idx + 1
-                job["message"] = f"Processing frame {frame_idx + 1} / {total_frames}"
-                if on_progress:
-                    on_progress(frame_idx + 1, total_frames, job["message"])
-            frame_idx += 1
+            dets = run_yolo(frame)
+            run_depth = (
+                depth_estimator
+                and depth_estimator.loaded
+                and frame is not None
+                and (depth_every_n <= 0 or (processed_count % depth_every_n) == 0)
+            )
+            if run_depth:
+                try:
+                    h, w = frame.shape[:2]
+                    depth_map = depth_estimator.infer(frame)
+                    if depth_map is not None:
+                        for d in dets:
+                            d["distance_meters"] = depth_estimator.depth_at_bbox(
+                                depth_map, d.get("bbox", [0, 0, 1, 1]), w, h
+                            )
+                except Exception:
+                    pass
+            processed_count += 1
+            detections_by_frame[frame_idx] = dets
+            job["current"] = processed_count
+            job["message"] = f"Processing {processed_count} / {job['total']}"
+            if on_progress:
+                on_progress(processed_count, job["total"], job["message"])
 
         cap.release()
 
@@ -246,6 +251,16 @@ def run_analyze_async(job_id: str, video_path: str, use_depth: bool = False) -> 
     return t
 
 
+def _safe_pdf_text(s: str, max_len: int = 200) -> str:
+    """Ensure text is safe for default FPDF Helvetica (Latin-1). Replace non-ASCII with '?'."""
+    if not s:
+        return ""
+    out = []
+    for c in (s[:max_len] if len(s) > max_len else s):
+        out.append(c if ord(c) < 256 else "?")
+    return "".join(out)
+
+
 def generate_report_pdf(job_id: str, out_path: Path) -> bool:
     """Generate a PDF report: list of objects found and a simple plan. Returns True on success."""
     job = _video_jobs.get(job_id)
@@ -255,22 +270,24 @@ def generate_report_pdf(job_id: str, out_path: Path) -> bool:
         from fpdf import FPDF
     except ImportError:
         return False
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     try:
         pdf = FPDF()
         pdf.add_page()
         pdf.set_font("Helvetica", "B", 16)
-        pdf.cell(0, 10, "CIPHER — Video Analysis Report", ln=True)
+        pdf.cell(0, 10, _safe_pdf_text("CIPHER — Video Analysis Report"), ln=True)
         pdf.set_font("Helvetica", "", 12)
-        pdf.cell(0, 8, f"Job: {job_id}", ln=True)
-        pdf.cell(0, 8, f"Frames: {job.get('total_frames', 0)} @ {job.get('fps', 30):.1f} fps", ln=True)
+        pdf.cell(0, 8, _safe_pdf_text(f"Job: {job_id}"), ln=True)
+        pdf.cell(0, 8, _safe_pdf_text(f"Frames: {job.get('total_frames', 0)} @ {job.get('fps', 30):.1f} fps"), ln=True)
         pdf.ln(6)
         pdf.set_font("Helvetica", "B", 12)
         pdf.cell(0, 8, "Objects detected", ln=True)
         pdf.set_font("Helvetica", "", 11)
-        summary = job.get("summary", {})
-        objs = summary.get("objects_found", {})
-        for cls, count in sorted(objs.items(), key=lambda x: -x[1]):
-            pdf.cell(0, 6, f"  • {cls}: {count} (max in a single frame)", ln=True)
+        summary = job.get("summary") or {}
+        objs = summary.get("objects_found") or {}
+        for cls, count in sorted(objs.items(), key=lambda x: (-x[1], str(x[0]))):
+            pdf.cell(0, 6, _safe_pdf_text(f"  • {cls}: {count} (max in a single frame)"), ln=True)
         pdf.ln(6)
         pdf.set_font("Helvetica", "B", 12)
         pdf.cell(0, 8, "Plan / summary", ln=True)
@@ -279,8 +296,10 @@ def generate_report_pdf(job_id: str, out_path: Path) -> bool:
             "Review the video playback with overlaid detections for full context. "
             "Prioritize high-confidence detections. Use the object list above for inventory or reporting."
         )
-        pdf.multi_cell(0, 6, plan)
+        pdf.multi_cell(0, 6, _safe_pdf_text(plan))
         pdf.output(str(out_path))
         return True
-    except Exception:
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning("PDF generation failed: %s", e, exc_info=True)
         return False

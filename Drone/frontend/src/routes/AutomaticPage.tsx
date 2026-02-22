@@ -42,6 +42,7 @@ export function AutomaticPage() {
   const [videoJob, setVideoJob] = useState<VideoAnalysisJob | null>(null);
   const [videoUploading, setVideoUploading] = useState(false);
   const [currentFrame, setCurrentFrame] = useState(0);
+  const [pdfError, setPdfError] = useState<string | null>(null);
   const videoPlaybackRef = useRef<HTMLVideoElement>(null);
   const videoOverlayRef = useRef<HTMLCanvasElement>(null);
   const videoPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -77,10 +78,11 @@ export function AutomaticPage() {
     setVideoUploading(true);
     setVideoJob(null);
     setVideoJobId(null);
+    setPdfError(null);
     try {
       const form = new FormData();
       form.append("file", file);
-      const r = await fetch(`${MAIN_BACKEND}/api/video/analyze?use_depth=true`, {
+      const r = await fetch(`${MAIN_BACKEND}/api/video/analyze?use_depth=false`, {
         method: "POST",
         body: form,
       });
@@ -116,35 +118,56 @@ export function AutomaticPage() {
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
     const idx = Math.min(frameIndex, job.detections_by_frame.length - 1);
-    if (idx < 0) {
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
-      return;
-    }
     const dets = job.detections_by_frame[idx] ?? [];
-    const vw = video.videoWidth || video.clientWidth;
-    const vh = video.videoHeight || video.clientHeight;
-    canvas.width = video.clientWidth;
-    canvas.height = video.clientHeight;
-    const scaleX = canvas.width / (vw || 1);
-    const scaleY = canvas.height / (vh || 1);
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    const vw = video.videoWidth || 1;
+    const vh = video.videoHeight || 1;
+    const elW = video.clientWidth;
+    const elH = video.clientHeight;
+    if (elW <= 0 || elH <= 0) return;
+    canvas.width = elW;
+    canvas.height = elH;
+    canvas.style.width = `${elW}px`;
+    canvas.style.height = `${elH}px`;
+    ctx.clearRect(0, 0, elW, elH);
+    if (idx < 0 || dets.length === 0) return;
+    const videoAspect = vw / vh;
+    const elAspect = elW / elH;
+    let contentX: number, contentY: number, contentW: number, contentH: number;
+    if (elAspect > videoAspect) {
+      contentH = elH;
+      contentW = elH * videoAspect;
+      contentX = (elW - contentW) / 2;
+      contentY = 0;
+    } else {
+      contentW = elW;
+      contentH = elW / videoAspect;
+      contentX = 0;
+      contentY = (elH - contentH) / 2;
+    }
+    const scaleX = contentW / vw;
+    const scaleY = contentH / vh;
     dets.forEach((det) => {
-      const [x1, y1, x2, y2] = det.bbox;
-      const bx = x1 * scaleX;
-      const by = y1 * scaleY;
+      const bbox = det.bbox;
+      if (!bbox || bbox.length < 4) return;
+      const x1 = Number(bbox[0]);
+      const y1 = Number(bbox[1]);
+      const x2 = Number(bbox[2]);
+      const y2 = Number(bbox[3]);
+      const bx = contentX + x1 * scaleX;
+      const by = contentY + y1 * scaleY;
       const bw = (x2 - x1) * scaleX;
       const bh = (y2 - y1) * scaleY;
       const distStr = det.distance_meters != null ? ` · ${Math.round(det.distance_meters * 100)}cm` : "";
       const label = `${det.class} ${(det.confidence * 100).toFixed(0)}%${distStr}`;
       ctx.strokeStyle = getSemanticClassColor(det.class);
-      ctx.lineWidth = 2;
+      ctx.lineWidth = 3;
       ctx.strokeRect(bx, by, bw, bh);
-      ctx.font = "bold 12px Inter, sans-serif";
-      const textW = ctx.measureText(label).width + 8;
+      ctx.font = "bold 13px Inter, sans-serif";
+      const textW = Math.min(ctx.measureText(label).width + 10, bw + 20);
       ctx.fillStyle = getSemanticClassColor(det.class);
-      ctx.fillRect(bx, by - 18, textW, 18);
+      ctx.fillRect(bx, by - 20, textW, 20);
       ctx.fillStyle = "#fff";
-      ctx.fillText(label, bx + 4, by - 4);
+      ctx.fillText(label, bx + 5, by - 5);
     });
   }, [videoJob, frameIndex]);
 
@@ -197,17 +220,26 @@ export function AutomaticPage() {
     : [];
 
   return (
-    <section className="manual-page" style={{ padding: "1rem" }}>
-      <h2 style={{ margin: "0 0 1rem", fontSize: "1.25rem", color: "rgba(255,255,255,0.95)" }}>
+    <section
+      className="manual-page"
+      style={{
+        padding: "clamp(0.75rem, 2vw, 1.25rem)",
+        display: "flex",
+        flexDirection: "column",
+        minHeight: 0,
+        flex: 1,
+      }}
+    >
+      <h2 style={{ margin: "0 0 0.5rem", fontSize: "clamp(1.1rem, 2.5vw, 1.35rem)", color: "rgba(255,255,255,0.95)" }}>
         Automatic — Upload video
       </h2>
-      <p style={{ margin: "0 0 1rem", fontSize: "0.9rem", color: "rgba(255,255,255,0.8)" }}>
-        Upload a video to run YOLO object detection and depth estimation. Play back with overlaid detections and download a PDF report with a list of objects found.
+      <p style={{ margin: "0 0 1rem", fontSize: "0.9rem", color: "rgba(255,255,255,0.8)", maxWidth: "56ch" }}>
+        Upload a video to run YOLO object detection. Step through frames with the controls below; download a PDF report when done.
       </p>
 
-      <div style={{ display: "flex", flex: 1, minHeight: 0, gap: "1rem", flexWrap: "wrap" }}>
+      <div style={{ display: "flex", flex: 1, minHeight: 0, gap: "clamp(0.75rem, 2vw, 1.25rem)", flexWrap: "wrap", alignContent: "flex-start" }}>
         {/* Left: upload + playback */}
-        <div style={{ flex: "1 1 400px", minWidth: 0, display: "flex", flexDirection: "column", gap: "0.75rem" }}>
+        <div style={{ flex: "1 1 min(100%, 420px)", minWidth: 0, display: "flex", flexDirection: "column", gap: "0.75rem" }}>
           <div style={{
             background: "rgba(0,0,0,0.35)",
             border: "2px dashed rgba(0,255,102,0.5)",
@@ -248,7 +280,7 @@ export function AutomaticPage() {
                   <video
                     ref={videoPlaybackRef}
                     src={`${MAIN_BACKEND}${videoJob.video_url}`}
-                    style={{ width: "100%", display: "block" }}
+                    style={{ width: "100%", display: "block", objectFit: "contain", maxHeight: "70vh" }}
                     crossOrigin="anonymous"
                     playsInline
                   />
@@ -264,46 +296,125 @@ export function AutomaticPage() {
                     }}
                   />
                 </div>
-                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: "0.5rem", fontSize: "0.85rem", color: "rgba(255,255,255,0.85)" }}>
-                  <span>
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    flexWrap: "wrap",
+                    gap: "0.75rem",
+                    padding: "0.5rem 0.75rem",
+                    background: "rgba(0,0,0,0.25)",
+                    borderRadius: 8,
+                    border: "1px solid rgba(255,255,255,0.1)",
+                  }}
+                >
+                  <div style={{ display: "flex", alignItems: "center", gap: "0.25rem" }}>
+                    <button
+                      type="button"
+                      aria-label="Previous frame"
+                      disabled={frameIndex <= 0}
+                      onClick={() => setCurrentFrame((f) => Math.max(0, f - 1))}
+                      style={{
+                        padding: "0.4rem 0.6rem",
+                        background: frameIndex <= 0 ? "rgba(255,255,255,0.1)" : "rgba(0,255,102,0.2)",
+                        border: "1px solid rgba(0,255,102,0.5)",
+                        borderRadius: 6,
+                        color: frameIndex <= 0 ? "rgba(255,255,255,0.4)" : "#00ff66",
+                        cursor: frameIndex <= 0 ? "not-allowed" : "pointer",
+                        fontWeight: 600,
+                        fontSize: "0.9rem",
+                      }}
+                    >
+                      ← Prev
+                    </button>
+                    <button
+                      type="button"
+                      aria-label="Next frame"
+                      disabled={frameIndex >= totalFrames}
+                      onClick={() => setCurrentFrame((f) => Math.min(totalFrames, f + 1))}
+                      style={{
+                        padding: "0.4rem 0.6rem",
+                        background: frameIndex >= totalFrames ? "rgba(255,255,255,0.1)" : "rgba(0,255,102,0.2)",
+                        border: "1px solid rgba(0,255,102,0.5)",
+                        borderRadius: 6,
+                        color: frameIndex >= totalFrames ? "rgba(255,255,255,0.4)" : "#00ff66",
+                        cursor: frameIndex >= totalFrames ? "not-allowed" : "pointer",
+                        fontWeight: 600,
+                        fontSize: "0.9rem",
+                      }}
+                    >
+                      Next →
+                    </button>
+                  </div>
+                  <span style={{ fontSize: "0.9rem", color: "rgba(255,255,255,0.9)" }}>
                     Frame <strong>{frameIndex + 1}</strong> / {videoJob.total_frames ?? 0}
                     {videoJob.detections_by_frame?.[frameIndex]?.length != null && (
-                      <span style={{ marginLeft: "0.5rem", color: "rgba(255,255,255,0.7)" }}>
-                        — {videoJob.detections_by_frame[frameIndex].length} object(s) in this frame
+                      <span style={{ marginLeft: "0.35rem", color: "rgba(255,255,255,0.65)" }}>
+                        · {videoJob.detections_by_frame[frameIndex].length} in frame
                       </span>
                     )}
                   </span>
-                  <span style={{ color: "rgba(0,255,102,0.9)" }}>← → arrow keys: previous / next frame</span>
+                  <span style={{ fontSize: "0.75rem", color: "rgba(0,255,102,0.75)" }}>
+                    ← → keys
+                  </span>
                 </div>
-                <a
-                  href={`${MAIN_BACKEND}/api/video/analysis/${videoJob.job_id}/report.pdf`}
-                  download={`cipher_video_report_${videoJob.job_id}.pdf`}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  style={{
-                    fontSize: "0.9rem",
-                    color: "#00ff66",
-                    textDecoration: "none",
-                    fontWeight: 600,
-                  }}
-                >
-                  Download PDF report
-                </a>
+                <div style={{ display: "flex", alignItems: "center", gap: "0.5rem", flexWrap: "wrap" }}>
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      setPdfError(null);
+                      try {
+                        const r = await fetch(`${MAIN_BACKEND}/api/video/analysis/${videoJob.job_id}/report.pdf`);
+                        if (!r.ok) {
+                          const err = await r.json().catch(() => ({}));
+                          setPdfError((err.detail as string) || "PDF download failed");
+                          return;
+                        }
+                        const blob = await r.blob();
+                        const url = URL.createObjectURL(blob);
+                        const a = document.createElement("a");
+                        a.href = url;
+                        a.download = `cipher_video_report_${videoJob.job_id}.pdf`;
+                        a.click();
+                        URL.revokeObjectURL(url);
+                      } catch {
+                        setPdfError("PDF download failed");
+                      }
+                    }}
+                    style={{
+                      fontSize: "0.9rem",
+                      color: "#0a0f19",
+                      background: "#00ff66",
+                      border: "none",
+                      borderRadius: 6,
+                      padding: "0.4rem 0.75rem",
+                      fontWeight: 600,
+                      cursor: "pointer",
+                    }}
+                  >
+                    Download PDF report
+                  </button>
+                  {pdfError && (
+                    <span style={{ fontSize: "0.8rem", color: "#ff6b6b" }}>{pdfError}</span>
+                  )}
+                </div>
               </div>
             )}
           </div>
         </div>
 
         {/* Right: list of objects detected */}
-        <div style={{ flex: "0 0 280px", minWidth: 0, display: "flex", flexDirection: "column", gap: "0.5rem" }}>
+        <div style={{ flex: "1 1 260px", minWidth: "min(100%, 260px)", maxWidth: 320, display: "flex", flexDirection: "column", gap: "0.5rem" }}>
           <span className="ai-panel-label">OBJECTS DETECTED</span>
           <div style={{
-            background: "rgba(0,0,0,0.3)",
-            border: "1px solid rgba(255,255,255,0.15)",
+            background: "rgba(0,0,0,0.35)",
+            border: "1px solid rgba(255,255,255,0.12)",
             borderRadius: 8,
             padding: "0.75rem",
-            maxHeight: 320,
+            maxHeight: "min(320px, 40vh)",
             overflowY: "auto",
+            flex: "1 1 auto",
+            minHeight: 0,
           }}>
             {objectsList.length === 0 && !videoJob?.summary && (
               <p style={{ margin: 0, fontSize: "0.85rem", color: "rgba(255,255,255,0.6)" }}>

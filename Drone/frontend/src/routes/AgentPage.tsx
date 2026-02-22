@@ -321,10 +321,10 @@ export function AgentPage() {
       </div>
 
       <div style={{ flex: 1, minHeight: 0, display: "flex" }}>
-        {/* Left 65%: current node frame (no boxes), detection pill bottom-left, structural risk bottom-right, V overlay */}
+        {/* Left 65%: current node frame (no boxes), detection pill bottom-left, structural risk bottom-right, V overlay. Only show an image after user adds video or runs a query — no random/pre-existing graph photo. */}
         <div style={{ flex: "0 0 65%", minWidth: 0, position: "relative", background: "#000", display: "flex", flexDirection: "column" }}>
           <div style={{ flex: 1, position: "relative", minHeight: 0 }}>
-            {currentNode?.image_b64 ? (
+            {((agentNodeIds.length > 0 || importStatus?.status === "complete") && currentNode?.image_b64) ? (
               <div style={{ width: "100%", height: "100%", position: "relative" }}>
                 <img
                   src={`data:image/jpeg;base64,${currentNode.image_b64}`}
@@ -353,12 +353,12 @@ export function AgentPage() {
                 <p style={{ fontSize: "0.85rem" }}>e.g. &quot;Where is the fire extinguisher?&quot; or &quot;Find the exit&quot;</p>
               </div>
             )}
-            {currentNode && currentNode.detections?.length > 0 && (
+            {(agentNodeIds.length > 0 || importStatus?.status === "complete") && currentNode && currentNode.detections?.length > 0 && (
               <div style={{ position: "absolute", bottom: 8, left: 8, background: "rgba(0,0,0,0.75)", color: "#fff", padding: "0.3rem 0.6rem", borderRadius: 6, fontSize: "0.75rem" }}>
                 {currentNode.detections.map((d) => `${d.class_name} ${Math.round(d.confidence * 100)}%`).join(" · ")}
               </div>
             )}
-            {currentNode && currentNode.structural_risk_score > 0 && (
+            {(agentNodeIds.length > 0 || importStatus?.status === "complete") && currentNode && currentNode.structural_risk_score > 0 && (
               <div style={{ position: "absolute", bottom: 8, right: 8, background: "rgba(255,136,0,0.85)", color: "#000", padding: "0.3rem 0.6rem", borderRadius: 6, fontSize: "0.75rem", fontWeight: 600 }}>
                 Structural risk
               </div>
