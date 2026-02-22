@@ -638,7 +638,7 @@ class VisionAgent:
 # ---------------------------------------------------------------------------
 
 
-@app.function(image=agent_image, gpu="H200", volumes={MODEL_DIR: model_vol}, timeout=600)
+@vision_app.function(image=agent_image, gpu="H200", volumes={MODEL_DIR: model_vol}, timeout=600)
 def spawn_agent(
     query: str,
     x: float,
@@ -656,7 +656,7 @@ def spawn_agent(
     Returns dict with keys:
         found, agent_id, description, final_image_b64, steps, trajectory
     """
-    runner = AgentRunner()
+    runner = VisionAgent()
     return runner.send_agent.remote(
         query=query,
         start_x=x, start_y=y, start_z=z,
@@ -671,7 +671,7 @@ def spawn_agent(
 # ---------------------------------------------------------------------------
 
 
-@app.function(image=agent_image, timeout=600)
+@vision_app.function(image=agent_image, timeout=600)
 @modal.fastapi_endpoint(method="POST")
 def stream_agents(request: dict):
     """SSE endpoint for streaming agent exploration to the frontend."""
@@ -699,7 +699,7 @@ def stream_agents(request: dict):
             yield f"data: {json.dumps(event)}\n\n"
 
         # Spawn agents and poll for completion
-        runner = AgentRunner()
+        runner = VisionAgent()
         handles = []
         for agent_id, agent_yaw in agent_configs:
             h = runner.send_agent.spawn(
@@ -808,7 +808,7 @@ def stream_agents(request: dict):
     )
 
 
-@app.function(image=agent_image)
+@vision_app.function(image=agent_image)
 @modal.fastapi_endpoint(method="OPTIONS")
 def stream_agents_options():
     """Handle CORS preflight requests for the streaming endpoint."""
@@ -827,7 +827,7 @@ def stream_agents_options():
 # ---------------------------------------------------------------------------
 
 
-@app.local_entrypoint()
+@vision_app.local_entrypoint()
 def main(
     query: str = "find the nearest bathroom",
     x: float = 0.0,
