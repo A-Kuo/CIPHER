@@ -21,7 +21,7 @@ import sys
 import time
 import uuid
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 from io import BytesIO
 
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
@@ -1540,6 +1540,182 @@ async def api_agent_run(body: AgentRunBody):
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         agent_state["running"] = False
+
+
+# ---------------------------------------------------------------------------
+# Video Analysis Agent - Natural Language Video Query
+# ---------------------------------------------------------------------------
+
+class VideoAnalysisRequest(BaseModel):
+    query: str
+    frames: Optional[List[Dict[str, Any]]] = None  # List of {image_b64, frame_idx, timestamp}
+    max_frames: int = 10
+    use_live_feed: bool = False
+    num_frames: int = 5
+    frame_interval: float = 0.5
+
+
+@app.post("/api/video/analyze")
+async def api_video_analyze(request: VideoAnalysisRequest):
+    """
+    Analyze video frames with natural language query.
+    
+    Supports:
+    - Uploaded video frames (provide frames list)
+    - Live feed analysis (set use_live_feed=True)
+    
+    Query types automatically detected:
+    - Object detection: "find the person", "detect vehicles"
+    - Action recognition: "what is happening", "describe the movement"
+    - Scene understanding: "describe the scene", "where is this"
+    - Temporal reasoning: "what changed", "sequence of events"
+    """
+    try:
+        if request.use_live_feed:
+            # Use world graph nodes as live feed frames
+            wg = _get_world_graph()
+            if wg is None or not hasattr(wg, "nodes") or len(wg.nodes) < 1:
+                raise HTTPException(
+                    status_code=400,
+                    detail="No live feed available. Start webcam or import video first."
+                )
+            
+            # Sample recent nodes as frames
+            nodes = list(wg.nodes.values())
+            frames = []
+            sample_count = min(request.num_frames, len(nodes))
+            step = max(1, len(nodes) // sample_count) if sample_count > 0 else 1
+            
+            for i in range(0, len(nodes), step):
+                if len(frames) >= sample_count:
+                    break
+                node = nodes[i]
+                if hasattr(node, "image_b64") and node.image_b64:
+                    frames.append({
+                        "image_b64": node.image_b64,
+                        "frame_idx": len(frames),
+                        "timestamp": len(frames) * request.frame_interval,
+                    })
+            
+            if not frames:
+                raise HTTPException(
+                    status_code=400,
+                    detail="No frames with images found in world graph."
+                )
+        else:
+            # Use provided frames
+            if not request.frames:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Either provide frames or set use_live_feed=True"
+                )
+            frames = request.frames
+        
+        # Use local video analysis agent
+        wg = _get_world_graph()
+        try:
+            from video_analysis_agent import analyze_video_query
+            result = analyze_video_query(
+                query=request.query,
+                frames=frames,
+                world_graph=wg,
+                models=models,
+                max_frames=request.max_frames,
+            )
+            return {
+                "answer": result.answer,
+                "confidence": result.confidence,
+                "relevant_frames": result.relevant_frames,
+                "objects_detected": result.objects_detected,
+                "scene_summary": result.scene_summary,
+                "temporal_events": result.temporal_events,
+                "query_type": result.query_type,
+                "spatial_match": result.spatial_match,
+                "knowledge_match": result.knowledge_match,
+            }
+        except ImportError:
+            # Fallback if module not available
+            raise HTTPException(
+                status_code=500,
+                detail="Video analysis agent not available. Ensure video_analysis_agent.py is in local_backend/."
+            )
+    except HTTPException:
+        raise
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"video/analyze: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/video/analyze_stream")
+async def api_video_analyze_stream(request: VideoAnalysisRequest):
+    """
+    Stream video analysis results as they become available (SSE).
+    Useful for long video analysis or real-time feed processing.
+    """
+    from fastapi.responses import StreamingResponse
+    import json
+    
+    async def event_generator():
+        try:
+            # Send initial event
+            yield f"data: {json.dumps({'type': 'started', 'message': 'Starting video analysis...'})}\n\n"
+            
+            # Process frames in batches
+            if request.use_live_feed:
+                wg = _get_world_graph()
+                if not wg or not hasattr(wg, "nodes"):
+                    yield f"data: {json.dumps({'type': 'error', 'message': 'No live feed available'})}\n\n"
+                    return
+                
+                nodes = list(wg.nodes.values())
+                frames = []
+                for i, node in enumerate(nodes[:request.num_frames]):
+                    if hasattr(node, "image_b64") and node.image_b64:
+                        frames.append({
+                            "image_b64": node.image_b64,
+                            "frame_idx": i,
+                            "timestamp": i * request.frame_interval,
+                        })
+            else:
+                frames = request.frames or []
+            
+            # Analyze each frame and stream results
+            for i, frame_data in enumerate(frames[:request.max_frames]):
+                try:
+                    image_b64 = frame_data.get("image_b64", "")
+                    if not image_b64:
+                        continue
+                    
+                    image_bytes = base64.b64decode(image_b64)
+                    image = Image.open(BytesIO(image_bytes)).convert("RGB")
+                    detections = models.detect_objects(image)
+                    
+                    event = {
+                        "type": "frame_analyzed",
+                        "frame_idx": frame_data.get("frame_idx", i),
+                        "timestamp": frame_data.get("timestamp", 0.0),
+                        "detections": detections,
+                        "detection_count": len(detections),
+                    }
+                    yield f"data: {json.dumps(event)}\n\n"
+                except Exception as e:
+                    yield f"data: {json.dumps({'type': 'error', 'frame_idx': i, 'message': str(e)})}\n\n"
+            
+            # Final summary
+            yield f"data: {json.dumps({'type': 'complete', 'message': f'Analyzed {len(frames)} frames'})}\n\n"
+        except Exception as e:
+            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+    
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "Access-Control-Allow-Origin": "*",
+        },
+    )
 
 
 # ---------------------------------------------------------------------------

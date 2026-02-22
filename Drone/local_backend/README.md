@@ -139,6 +139,99 @@ Streams agent exploration events via Server-Sent Events (SSE).
 
 **Response:** SSE stream of events (agent_started, agent_step, agent_found, agent_done, session_complete)
 
+### POST /api/video/analyze
+Natural language video analysis with token-based queries. Analyzes uploaded video frames or live feed.
+
+**Request Body:**
+```json
+{
+  "query": "What objects are visible in the video?",
+  "frames": [
+    {
+      "image_b64": "base64_encoded_jpeg",
+      "frame_idx": 0,
+      "timestamp": 0.0
+    }
+  ],
+  "max_frames": 10,
+  "use_live_feed": false,
+  "num_frames": 5,
+  "frame_interval": 0.5
+}
+```
+
+**For Live Feed Analysis:**
+```json
+{
+  "query": "Find all people in the live feed",
+  "use_live_feed": true,
+  "num_frames": 5,
+  "frame_interval": 0.5
+}
+```
+
+**Response:**
+```json
+{
+  "answer": "Frame 0 (t=0.00s): Detected person, car. Query relevance: 0.85...",
+  "confidence": 0.8,
+  "relevant_frames": [
+    {
+      "frame_idx": 0,
+      "timestamp": 0.0,
+      "image_b64": "...",
+      "description": "Frame 0: Detected person, car..."
+    }
+  ],
+  "objects_detected": [
+    {
+      "class": "person",
+      "confidence": 0.92,
+      "frame_idx": 0,
+      "timestamp": 0.0
+    }
+  ],
+  "scene_summary": "Analyzed 5 frames. Found 3 unique object types: person, car, bottle",
+  "temporal_events": [
+    {
+      "event_type": "change",
+      "start_frame": 0,
+      "end_frame": 1,
+      "description": "Added: person; Removed: car"
+    }
+  ],
+  "query_type": "object",
+  "spatial_match": true,
+  "knowledge_match": false
+}
+```
+
+**Query Types (Auto-detected):**
+- **Object**: "find the person", "detect vehicles", "identify objects"
+- **Action**: "what is happening", "describe the movement", "what are they doing"
+- **Scene**: "describe the scene", "where is this", "what location"
+- **Temporal**: "what changed", "sequence of events", "what happened before/after"
+- **General**: Any other query
+
+**Features:**
+- Integrates with spatial agent for location queries
+- Integrates with knowledge agent for procedural queries
+- Uses YOLO for object detection
+- Uses CLIP for semantic matching
+- Temporal reasoning across frames
+- Object tracking across frames
+
+### POST /api/video/analyze_stream
+Stream video analysis results as they become available (SSE). Useful for long videos or real-time processing.
+
+**Request Body:** Same as `/api/video/analyze`
+
+**Response:** SSE stream with events:
+- `started`: Analysis started
+- `frame_analyzed`: Each frame analyzed (includes detections)
+- `complete`: Analysis finished
+- `error`: Error occurred
+
 ## Performance Tips
 
 ### For Faster Inference:
