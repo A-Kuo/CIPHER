@@ -88,7 +88,7 @@ _EXPORTS_DIR = _DRONE2_ROOT / "exports"
 FRAME_INTERVAL = 0.1
 STEP_SIZE = 0.1
 ALLOWED_THRESHOLD = 0.15
-MAX_STEPS = 15
+MAX_STEPS = 20
 
 DIRECTION_OFFSETS = {
     0:   {"forward": (1, 0),  "backward": (-1, 0),  "left": (0, -1), "right": (0, 1)},
@@ -955,9 +955,20 @@ async def stream_agents(request: AgentRequest):
     async def event_generator():
         winner_agent_id = None
 
+        # Compute diverse starting yaws
+        def _snap_yaw(y):
+            return round(y / 90) % 4 * 90
+
+        agent_yaws = []
+        for agent_id in range(request.num_agents):
+            if request.num_agents <= 2:
+                raw = (request.start_yaw + agent_id * 180) % 360
+            else:
+                raw = (request.start_yaw + agent_id * (360 // request.num_agents)) % 360
+            agent_yaws.append(_snap_yaw(raw))
+
         # Send agent_started events
         for agent_id in range(request.num_agents):
-            agent_yaw = (request.start_yaw + (agent_id % 2) * 180) % 360
             event = {
                 "type": "agent_started",
                 "agent_id": agent_id,
@@ -965,7 +976,7 @@ async def stream_agents(request: AgentRequest):
                     "x": request.start_x,
                     "y": request.start_y,
                     "z": request.start_z,
-                    "yaw": agent_yaw,
+                    "yaw": agent_yaws[agent_id],
                 },
             }
             yield f"data: {json.dumps(event)}\n\n"
@@ -979,7 +990,7 @@ async def stream_agents(request: AgentRequest):
 
         runner = AgentRunner(models, image_db)
         for agent_id in range(request.num_agents):
-            agent_yaw = (request.start_yaw + (agent_id % 2) * 180) % 360
+            agent_yaw = agent_yaws[agent_id]
             try:
                 for event in runner.run_agent(
                     query=request.query,

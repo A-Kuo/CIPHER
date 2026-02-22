@@ -1,9 +1,13 @@
-"""Drone Vision – parallel building-exploration agents powered by a vision LLM.
+"""DEPRECATED — use Drone/agents/agents.py instead.
 
-Usage:
-    modal deploy agents/agents.py
-
-Requires app.py to be deployed first (provides the GetImage class).
+This file is kept for reference only. The active agent code lives in
+Drone/agents/agents.py which fixes critical accuracy issues present here:
+  - Discrete actions (forward/turnLeft/etc) instead of absolute coordinates
+  - Enforced allowed-direction constraints
+  - Visited-position tracking to prevent loops
+  - Cardinal yaw snapping (0/90/180/270) for reliable navigation
+  - Qwen3 <think> tag stripping in the JSON parser
+  - Lower temperature (0.2) for consistent structured output
 """
 
 import base64

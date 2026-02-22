@@ -3,12 +3,13 @@
 Usage:
     modal deploy agents/agents.py
 
-Requires app.py to be deployed first (provides the GetImage class).
+Requires app.py to be deployed first (provides the ImageServer class).
 """
 
 import base64
 import json
 import math
+import re
 import time
 import uuid
 
@@ -16,24 +17,30 @@ import modal
 from starlette.responses import StreamingResponse, Response
 
 # ---------------------------------------------------------------------------
-# Model registry – add new vision-language models here
+# Model registry
 # ---------------------------------------------------------------------------
 
 SUPPORTED_MODELS: dict[str, str] = {
     "qwen3-vl-30b-a3b-thinking-fp8": "Qwen/Qwen3-VL-30B-A3B-Thinking-FP8",
     "qwen3-vl-2b": "Qwen/Qwen3-VL-2B-Instruct",
-    # "qwen3-vl-8b": "Qwen/Qwen3-VL-8B-Instruct",
-    # "qwen2.5-vl-3b": "Qwen/Qwen2.5-VL-3B-Instruct",
 }
 DEFAULT_MODEL = "qwen3-vl-30b-a3b-thinking-fp8"
 MODEL_ID = SUPPORTED_MODELS[DEFAULT_MODEL]
 
-MAX_STEPS = 15
+MAX_STEPS = 20  # synced with frontend MAX_AGENT_STEPS
+STEP_SIZE = 0.1  # meters per movement step
 
 # ---------------------------------------------------------------------------
-# Trajectory bounds (from trajectory_postprocessed.csv) – keeps agents
-# inside the mapped building volume.
+# Direction offsets: yaw -> {direction: (dx, dy)}
+# yaw=0 -> facing +x, yaw=90 -> facing +y, etc.
 # ---------------------------------------------------------------------------
+
+DIRECTION_OFFSETS = {
+    0:   {"forward": (1, 0),  "backward": (-1, 0),  "left": (0, -1), "right": (0, 1)},
+    90:  {"forward": (0, 1),  "backward": (0, -1),  "left": (1, 0),  "right": (-1, 0)},
+    180: {"forward": (-1, 0), "backward": (1, 0),   "left": (0, 1),  "right": (0, -1)},
+    270: {"forward": (0, -1), "backward": (0, 1),   "left": (-1, 0), "right": (1, 0)},
+}
 
 BOUNDS = {
     "x": (-200, 200),
@@ -46,6 +53,7 @@ BOUNDS = {
 # ---------------------------------------------------------------------------
 
 from app import app as vision_app, ImageServer
+
 model_vol = modal.Volume.from_name("vision-model-cache", create_if_missing=True)
 cancel_dict = modal.Dict.from_name("vision-cancel", create_if_missing=True)
 
@@ -77,73 +85,54 @@ agent_image = (
 )
 
 # ---------------------------------------------------------------------------
-# System prompt template
+# System prompt — uses discrete actions instead of absolute coordinates
 # ---------------------------------------------------------------------------
 
 SYSTEM_PROMPT = """\
-You are a building-exploration agent.  You navigate a discrete grid by
+You are a building-exploration agent. You navigate a discrete grid by
 choosing movement actions.
 
 ## Coordinate system
-- The world uses (x, y, z) coordinates with step size 0.1 meters.
-- **x and y** are the horizontal axes (the floor plane). **z** is the
-  vertical axis (floor level) — do NOT change z unless moving between floors.
-- **yaw** is your facing direction in degrees. Only use: 0, 90, 180, 270.
-  - yaw=0 → facing +x direction
-  - yaw=90 → facing +y direction
-  - yaw=180 → facing -x direction
-  - yaw=270 → facing -y direction
+- The world uses (x, y, z) coordinates with step size {step_size} meters.
+- **yaw** is your facing direction in degrees: 0, 90, 180, or 270 only.
 
-## Movement rules
-Each turn you will see which directions are **allowed** (true/false):
-  forward, backward, left, right, turnLeft, turnRight
+## Available actions
+Each turn you will see which directions are **allowed** (true/false).
+You MUST only choose an allowed action.
 
-You MUST only move in allowed directions. To move:
-- **forward**: advance 0.1m in your facing direction
-  - yaw=0 → x += 0.1
-  - yaw=90 → y += 0.1
-  - yaw=180 → x -= 0.1
-  - yaw=270 → y -= 0.1
-- **backward**: opposite of forward
-- **left/right**: strafe perpendicular to facing direction
-- **turnLeft**: yaw -= 90 (position stays the same)
-- **turnRight**: yaw += 90 (position stays the same)
-
-IMPORTANT: Do NOT invent arbitrary coordinate changes. Only change x or y by
-exactly 0.1 (or -0.1) per step, and only in allowed directions. Keep z the
-same unless you are changing floors.
+Actions:
+- **forward**: move {step_size}m in your facing direction
+- **backward**: move {step_size}m opposite to your facing direction
+- **left**: strafe {step_size}m to your left
+- **right**: strafe {step_size}m to your right
+- **turnLeft**: rotate yaw by -90 degrees (position stays the same)
+- **turnRight**: rotate yaw by +90 degrees (position stays the same)
 
 ## Your task
-The user asked: "{query}"
+The user asked: "{{query}}"
 Explore the building to find what they asked for.
 
 ## How to respond
-Each turn you receive an image, your position, and which directions are
-allowed.  Output **only** a JSON object (no markdown, no extra text):
+Output **only** a JSON object (no markdown, no extra text):
 
 If you have NOT found the target:
-{{"action": "move", "x": <float>, "y": <float>, "z": <float>, "yaw": <float>, "reasoning": "<1-2 sentences>"}}
+{{"action": "<forward|backward|left|right|turnLeft|turnRight>", "reasoning": "<1-2 sentences>"}}
 
 If you CAN SEE the target in the current image:
 {{"action": "found", "description": "<what and where you see it>", "confidence": "<low|medium|high>", "evidence": ["<visual cue 1>", "<visual cue 2>"]}}
 
-Use "found" only when confidence is HIGH based on direct visual evidence in
-the current image.
-
-Before using "found", self-check:
-1) The object's identity matches the query (not just similar-looking).
-2) Its location in the image is explicit (left/center/right + nearby context).
-3) You can cite at least two concrete visual attributes (shape/color/text/context).
-
-Do NOT use "found" if the object is partially occluded, blurry, too far, or
-ambiguous.  Instead "move" closer or rotate.
-
-Do NOT revisit positions you have already been to.
-"""
+## Rules
+- Use "found" ONLY when confidence is HIGH with direct visual evidence.
+- Before "found", verify: (1) identity matches query, (2) location in image
+  is clear, (3) at least two visual attributes confirm it.
+- Do NOT use "found" if the object is occluded, blurry, too far, or ambiguous.
+- Do NOT revisit positions you have already been to.
+- Prefer exploring new directions over going back and forth.
+""".format(step_size=STEP_SIZE)
 
 
 # ---------------------------------------------------------------------------
-# AgentRunner class
+# VisionAgent class
 # ---------------------------------------------------------------------------
 
 
@@ -185,25 +174,19 @@ class VisionAgent:
     ) -> dict:
         """Run one exploration agent.
 
-        Each turn the LLM receives a fresh two-message prompt:
-          1. System: original query/instructions + a text summary of
-             every prior step (position, reasoning).
-          2. User: only the CURRENT image + current position.
-
-        This keeps context small (one image per call) while giving the
-        LLM full memory of where it has been and what it decided.
-
         Returns dict with keys:
             found, agent_id, description, final_image_b64,
-            steps, trajectory
+            steps, trajectory, directions, filename
         """
         from vllm import SamplingParams
 
-        x, y, z, yaw = start_x, start_y, start_z, start_yaw
+        x, y, z, yaw = start_x, start_y, start_z, _snap_yaw(start_yaw)
         trajectory: list[dict] = []
-        history_lines: list[str] = []   # text-only memory of past turns
+        history_lines: list[str] = []
+        visited: set[tuple[float, float, float, float]] = set()
         last_image_b64 = ""
-        sampling = SamplingParams(temperature=0.7, max_tokens=300)
+        last_filename = ""
+        sampling = SamplingParams(temperature=0.2, max_tokens=300)
 
         print(f"\n{'='*60}")
         print(f"[Agent {agent_id}] START  query={query!r}")
@@ -234,8 +217,13 @@ class VisionAgent:
             actual_yaw = result["yaw"]
             allowed = result["allowed"]
             filename = result.get("filename", "?")
+            last_filename = filename
             img_b64 = base64.b64encode(img_bytes).decode("ascii")
             last_image_b64 = img_b64
+
+            # Track visited positions
+            pos_key = (round(actual_x, 1), round(actual_y, 1), round(actual_z, 1), _snap_yaw(actual_yaw))
+            visited.add(pos_key)
 
             print(f"[Agent {agent_id}]   -> file={filename}  actual=({actual_x:.2f},{actual_y:.2f},{actual_z:.2f}) yaw={actual_yaw:.1f}  allowed={allowed}")
 
@@ -252,6 +240,11 @@ class VisionAgent:
                     + "\n".join(history_lines)
                 )
 
+            # -- build allowed string with revisit warnings -------------
+            allowed_with_revisit = _annotate_allowed_revisits(
+                x, y, z, yaw, allowed, visited
+            )
+
             # -- fresh prompt: system + current image only --------------
             messages = [
                 {"role": "system", "content": [{"type": "text", "text": sys_text}]},
@@ -260,14 +253,14 @@ class VisionAgent:
                     "content": [
                         {
                             "type": "image_url",
-                            "image_url": {"url": f"data:image/png;base64,{img_b64}"},
+                            "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"},
                         },
                         {
                             "type": "text",
                             "text": (
-                                f"Position: ({actual_x:.2f}, {actual_y:.2f}, {actual_z:.2f}), yaw={yaw:.1f}. "
-                                f"Step {step}/{MAX_STEPS}. "
-                                f"Allowed: {json.dumps(allowed)}"
+                                f"Position: ({actual_x:.2f}, {actual_y:.2f}, {actual_z:.2f}), yaw={yaw:.1f}.\n"
+                                f"Step {step + 1}/{MAX_STEPS}.\n"
+                                f"Allowed: {json.dumps(allowed_with_revisit)}"
                             ),
                         },
                     ],
@@ -277,63 +270,67 @@ class VisionAgent:
             # -- VLM inference ------------------------------------------
             outputs = self.llm.chat(messages, sampling_params=sampling)
             raw_text = outputs[0].outputs[0].text.strip()
-            print(f"[Agent {agent_id}]   LLM reasoning: {raw_text}")
+            print(f"[Agent {agent_id}]   LLM raw: {raw_text[:200]}")
 
             # -- parse JSON action --------------------------------------
-            action = self._parse_action(raw_text)
+            action = _parse_action(raw_text)
             if action is None:
-                print(f"[Agent {agent_id}]   (parse failed – rotating 30 deg)")
+                print(f"[Agent {agent_id}]   (parse failed - turning right 90)")
                 history_lines.append(
                     f"- Step {step}: pos=({x:.2f},{y:.2f},{z:.2f}) yaw={yaw:.1f} "
-                    f"— could not decide, rotated 30 deg"
+                    f"- could not decide, turned right"
                 )
-                yaw = (yaw + 30) % 360
+                yaw = (yaw + 90) % 360
                 continue
 
             print(f"[Agent {agent_id}]   Parsed action: {action}")
 
             if action.get("action") == "found":
-                ok, validation_msg = self._validate_found_action(action)
+                ok, validation_msg = _validate_found_action(action)
                 if not ok:
                     print(f"[Agent {agent_id}]   (reject found: {validation_msg})")
                     history_lines.append(
                         f"- Step {step}: pos=({x:.2f},{y:.2f},{z:.2f}) yaw={yaw:.1f} "
-                        f"— rejected found ({validation_msg}), rotated 20 deg"
+                        f"- rejected found ({validation_msg}), turned right"
                     )
-                    yaw = (yaw + 20) % 360
+                    yaw = (yaw + 90) % 360
                     continue
 
                 desc = str(action.get("description", ""))
                 print(f"\n[Agent {agent_id}] *** FOUND at step {step}: {desc} ***")
-                print(f"[Agent {agent_id}]     Image file: {filename}")
-                print(f"[Agent {agent_id}]     Position: ({actual_x:.2f}, {actual_y:.2f}, {actual_z:.2f}) yaw={actual_yaw:.1f}\n")
-                directions = self._build_directions(trajectory)
+                directions = _build_directions(trajectory)
                 return self._result(True, agent_id, desc,
                                     last_image_b64, step, trajectory,
                                     directions=directions, filename=filename)
 
-            if action.get("action") == "move":
-                reasoning = action.get("reasoning", "")
-                history_lines.append(
-                    f"- Step {step}: pos=({x:.2f},{y:.2f},{z:.2f}) yaw={yaw:.1f} — {reasoning}"
-                )
-                x = self._clamp(float(action.get("x", x)), *BOUNDS["x"])
-                y = self._clamp(float(action.get("y", y)), *BOUNDS["y"])
-                z = self._clamp(float(action.get("z", z)), *BOUNDS["z"])
-                yaw = float(action.get("yaw", yaw)) % 360
-            else:
+            # -- apply discrete action ----------------------------------
+            act_name = action.get("action", "")
+            reasoning = action.get("reasoning", "")
+
+            new_x, new_y, new_z, new_yaw = _apply_action(
+                act_name, x, y, z, yaw, allowed
+            )
+
+            if new_x == x and new_y == y and new_z == z and new_yaw == yaw:
+                # Action was not allowed or unrecognized; fallback turn
+                print(f"[Agent {agent_id}]   (action '{act_name}' not allowed - turning right)")
                 history_lines.append(
                     f"- Step {step}: pos=({x:.2f},{y:.2f},{z:.2f}) yaw={yaw:.1f} "
-                    f"— unknown action, rotated 30 deg"
+                    f"- '{act_name}' blocked, turned right"
                 )
-                yaw = (yaw + 30) % 360
+                yaw = (yaw + 90) % 360
+            else:
+                history_lines.append(
+                    f"- Step {step}: pos=({x:.2f},{y:.2f},{z:.2f}) yaw={yaw:.1f} -> {act_name} - {reasoning}"
+                )
+                x, y, z, yaw = new_x, new_y, new_z, new_yaw
 
         print(f"[Agent {agent_id}] Max steps reached")
-        directions = self._build_directions(trajectory)
+        directions = _build_directions(trajectory)
         return self._result(False, agent_id,
                             "Max steps reached without finding target",
                             last_image_b64, MAX_STEPS, trajectory,
-                            directions=directions, filename=filename)
+                            directions=directions, filename=last_filename)
 
     # ------------------------------------------------------------------ #
     # Streaming version
@@ -350,16 +347,17 @@ class VisionAgent:
         agent_id: int,
         session_key: str,
     ):
-        """Generator version of send_agent — yields step-by-step events."""
+        """Generator version of send_agent - yields step-by-step events."""
         from vllm import SamplingParams
         from io import BytesIO
         from PIL import Image
 
-        x, y, z, yaw = start_x, start_y, start_z, start_yaw
+        x, y, z, yaw = start_x, start_y, start_z, _snap_yaw(start_yaw)
         trajectory = []
         history_lines = []
+        visited: set[tuple[float, float, float, float]] = set()
         last_image_b64 = ""
-        sampling = SamplingParams(temperature=0.7, max_tokens=300)
+        sampling = SamplingParams(temperature=0.2, max_tokens=300)
 
         base_sys_text = SYSTEM_PROMPT.format(query=query)
 
@@ -380,11 +378,15 @@ class VisionAgent:
             img_b64 = base64.b64encode(img_bytes).decode("ascii")
             last_image_b64 = img_b64
 
+            # Track visited
+            pos_key = (round(actual_x, 1), round(actual_y, 1), round(actual_z, 1), _snap_yaw(result["yaw"]))
+            visited.add(pos_key)
+
             # Downscale for streaming (256x256)
             img = Image.open(BytesIO(img_bytes))
             img_small = img.resize((256, 256), Image.LANCZOS)
             buf = BytesIO()
-            img_small.save(buf, format="PNG")
+            img_small.save(buf, format="JPEG", quality=80)
             small_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
 
             trajectory.append({"x": x, "y": y, "z": z, "yaw": yaw, "step": step})
@@ -394,19 +396,23 @@ class VisionAgent:
             if history_lines:
                 sys_text += "\n\n## Trajectory so far\n" + "\n".join(history_lines)
 
+            allowed_with_revisit = _annotate_allowed_revisits(
+                x, y, z, yaw, allowed, visited
+            )
+
             # Fresh prompt: system + current image only
             messages = [
                 {"role": "system", "content": [{"type": "text", "text": sys_text}]},
                 {
                     "role": "user",
                     "content": [
-                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}},
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
                         {
                             "type": "text",
                             "text": (
-                                f"Position: ({actual_x:.2f}, {actual_y:.2f}, {actual_z:.2f}), yaw={yaw:.1f}. "
-                                f"Step {step}/{MAX_STEPS}. "
-                                f"Allowed: {json.dumps(allowed)}"
+                                f"Position: ({actual_x:.2f}, {actual_y:.2f}, {actual_z:.2f}), yaw={yaw:.1f}.\n"
+                                f"Step {step + 1}/{MAX_STEPS}.\n"
+                                f"Allowed: {json.dumps(allowed_with_revisit)}"
                             ),
                         },
                     ],
@@ -418,42 +424,47 @@ class VisionAgent:
             raw_text = outputs[0].outputs[0].text.strip()
 
             # Parse action
-            action = self._parse_action(raw_text)
+            action = _parse_action(raw_text)
             reasoning = ""
             action_type = "move"
 
             if action is None:
-                reasoning = "(parse failed - rotating)"
+                reasoning = "(parse failed - turning right)"
                 history_lines.append(
                     f"- Step {step}: pos=({x:.2f},{y:.2f},{z:.2f}) yaw={yaw:.1f} "
-                    f"— could not decide, rotated 30 deg"
+                    f"- could not decide, turned right"
                 )
-                yaw = (yaw + 30) % 360
+                yaw = (yaw + 90) % 360
             elif action.get("action") == "found":
-                ok, validation_msg = self._validate_found_action(action)
+                ok, validation_msg = _validate_found_action(action)
                 if not ok:
                     reasoning = f"(rejected found: {validation_msg})"
                     history_lines.append(
                         f"- Step {step}: pos=({x:.2f},{y:.2f},{z:.2f}) yaw={yaw:.1f} "
-                        f"— rejected found ({validation_msg}), rotated 20 deg"
+                        f"- rejected found ({validation_msg}), turned right"
                     )
-                    yaw = (yaw + 20) % 360
+                    yaw = (yaw + 90) % 360
                 else:
                     action_type = "found"
                     reasoning = action.get("description", "")
-            elif action.get("action") == "move":
-                reasoning = action.get("reasoning", "")
-                action_type = "move"
-                history_lines.append(
-                    f"- Step {step}: pos=({x:.2f},{y:.2f},{z:.2f}) yaw={yaw:.1f} — {reasoning}"
-                )
             else:
-                reasoning = raw_text[:100]
-                history_lines.append(
-                    f"- Step {step}: pos=({x:.2f},{y:.2f},{z:.2f}) yaw={yaw:.1f} "
-                    f"— unknown action, rotated 30 deg"
+                act_name = action.get("action", "")
+                reasoning = action.get("reasoning", "")
+                new_x, new_y, new_z, new_yaw = _apply_action(
+                    act_name, x, y, z, yaw, allowed
                 )
-                yaw = (yaw + 30) % 360
+                if new_x == x and new_y == y and new_z == z and new_yaw == yaw:
+                    reasoning = f"('{act_name}' blocked - turning right)"
+                    history_lines.append(
+                        f"- Step {step}: pos=({x:.2f},{y:.2f},{z:.2f}) yaw={yaw:.1f} "
+                        f"- '{act_name}' blocked, turned right"
+                    )
+                    yaw = (yaw + 90) % 360
+                else:
+                    history_lines.append(
+                        f"- Step {step}: pos=({x:.2f},{y:.2f},{z:.2f}) yaw={yaw:.1f} -> {act_name} - {reasoning}"
+                    )
+                    x, y, z, yaw = new_x, new_y, new_z, new_yaw
 
             # Yield the step event
             yield {
@@ -468,24 +479,16 @@ class VisionAgent:
             }
 
             if action_type == "found":
-                filename = result.get("filename", "")
                 yield {
                     "type": "agent_found",
                     "agent_id": agent_id,
                     "description": reasoning,
                     "final_image_b64": last_image_b64,
-                    "filename": filename,
+                    "filename": result.get("filename", ""),
                     "steps": step + 1,
                     "trajectory": trajectory,
                 }
                 return
-
-            # Apply move
-            if action and action.get("action") == "move":
-                x = self._clamp(float(action.get("x", x)), *BOUNDS["x"])
-                y = self._clamp(float(action.get("y", y)), *BOUNDS["y"])
-                z = self._clamp(float(action.get("z", z)), *BOUNDS["z"])
-                yaw = float(action.get("yaw", yaw)) % 360
 
         # Max steps reached
         yield {
@@ -514,131 +517,202 @@ class VisionAgent:
             "directions": directions or [],
         }
 
-    @staticmethod
-    def _clamp(v: float, lo: float, hi: float) -> float:
-        return max(lo, min(hi, v))
 
-    @staticmethod
-    def _build_directions(trajectory: list[dict]) -> list[str]:
-        """Build human-readable step-by-step directions from the trajectory.
+# ---------------------------------------------------------------------------
+# Pure-function helpers (no self — testable in isolation)
+# ---------------------------------------------------------------------------
 
-        Consolidates consecutive steps in the same direction into single
-        instructions like 'Walk forward 3 steps' rather than listing every
-        micro-movement.
-        """
-        if len(trajectory) < 2:
-            return ["You are already at the destination."]
+def _snap_yaw(yaw: float) -> float:
+    """Snap yaw to nearest cardinal direction (0, 90, 180, 270)."""
+    return round(yaw / 90) % 4 * 90
 
-        YAW_NAMES = {0: "north", 90: "east", 180: "south", 270: "west"}
 
-        def _describe_move(prev, curr):
-            dx = curr["x"] - prev["x"]
-            dy = curr["y"] - prev["y"]
-            dz = curr["z"] - prev["z"]
-            dyaw = (curr["yaw"] - prev["yaw"]) % 360
+def _clamp(v: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, v))
 
-            parts = []
-            if dyaw != 0:
-                if dyaw == 90 or dyaw == -270:
-                    parts.append("turn right")
-                elif dyaw == 270 or dyaw == -90:
-                    parts.append("turn left")
-                elif dyaw == 180:
-                    parts.append("turn around")
-                else:
-                    parts.append(f"rotate {dyaw:.0f}°")
 
-            dist = math.sqrt(dx**2 + dy**2 + dz**2)
-            if dist > 0.05:
-                parts.append("walk forward")
+def _apply_action(
+    action: str,
+    x: float, y: float, z: float, yaw: float,
+    allowed: dict,
+) -> tuple[float, float, float, float]:
+    """Compute new (x, y, z, yaw) from a discrete action.
 
-            if abs(dz) > 0.5:
-                parts.append("go up" if dz > 0 else "go down")
+    Returns the original position unchanged if the action is not allowed.
+    """
+    yaw_key = int(round(yaw)) % 360
 
-            return " then ".join(parts) if parts else None
+    if action == "turnLeft":
+        if allowed.get("turnLeft", False):
+            return x, y, z, (yaw_key - 90) % 360
+        return x, y, z, yaw_key
 
-        directions = []
-        prev = trajectory[0]
-        facing = int(round(prev["yaw"])) % 360
-        facing_name = YAW_NAMES.get(facing, f"{facing}°")
-        directions.append(f"Start at ({prev['x']:.1f}, {prev['y']:.1f}, {prev['z']:.1f}) facing {facing_name}.")
+    if action == "turnRight":
+        if allowed.get("turnRight", False):
+            return x, y, z, (yaw_key + 90) % 360
+        return x, y, z, yaw_key
 
-        # Group consecutive similar moves
-        i = 1
-        while i < len(trajectory):
-            curr = trajectory[i]
-            move = _describe_move(prev, curr)
-            if move is None:
-                prev = curr
-                i += 1
-                continue
+    if action in ("forward", "backward", "left", "right"):
+        if not allowed.get(action, False):
+            return x, y, z, yaw_key
+        offsets = DIRECTION_OFFSETS.get(yaw_key, DIRECTION_OFFSETS[0])
+        dx, dy = offsets.get(action, (0, 0))
+        new_x = _clamp(x + dx * STEP_SIZE, *BOUNDS["x"])
+        new_y = _clamp(y + dy * STEP_SIZE, *BOUNDS["y"])
+        return new_x, new_y, z, yaw_key
 
-            # Count consecutive identical moves
+    # Unknown action
+    return x, y, z, yaw_key
+
+
+def _annotate_allowed_revisits(
+    x: float, y: float, z: float, yaw: float,
+    allowed: dict,
+    visited: set[tuple[float, float, float, float]],
+) -> dict:
+    """Return allowed dict with '(revisit)' warnings for directions leading
+    to already-visited positions."""
+    yaw_key = int(round(yaw)) % 360
+    offsets = DIRECTION_OFFSETS.get(yaw_key, DIRECTION_OFFSETS[0])
+    annotated = {}
+
+    for direction, is_allowed in allowed.items():
+        if not is_allowed:
+            annotated[direction] = False
+            continue
+
+        if direction in ("turnLeft", "turnRight"):
+            turn_yaw = (yaw_key - 90) % 360 if direction == "turnLeft" else (yaw_key + 90) % 360
+            dest_key = (round(x, 1), round(y, 1), round(z, 1), turn_yaw)
+            if dest_key in visited:
+                annotated[direction] = "true (revisit)"
+            else:
+                annotated[direction] = True
+        elif direction in offsets:
+            dx, dy = offsets[direction]
+            dest_key = (round(x + dx * STEP_SIZE, 1), round(y + dy * STEP_SIZE, 1), round(z, 1), yaw_key)
+            if dest_key in visited:
+                annotated[direction] = "true (revisit)"
+            else:
+                annotated[direction] = True
+        else:
+            annotated[direction] = is_allowed
+
+    return annotated
+
+
+def _parse_action(text: str) -> dict | None:
+    """Best-effort JSON extraction from LLM output.
+
+    Handles:
+    - Qwen3 <think>...</think> blocks
+    - Markdown ```json fences
+    - Raw JSON
+    """
+    # Strip Qwen3 thinking tags
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+
+    # Strip markdown fences if present
+    if "```" in text:
+        parts = text.split("```")
+        if len(parts) >= 2:
+            text = parts[1]
+            if text.startswith("json"):
+                text = text[4:]
+
+    # Find JSON object boundaries
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None
+    try:
+        return json.loads(text[start : end + 1])
+    except json.JSONDecodeError:
+        return None
+
+
+def _validate_found_action(action: dict) -> tuple[bool, str]:
+    """Require high-confidence structured evidence before accepting found."""
+    desc = str(action.get("description", "")).strip()
+    if not desc:
+        return False, "missing description"
+
+    confidence = str(action.get("confidence", "")).strip().lower()
+    if confidence != "high":
+        return False, f'confidence must be "high" (got {confidence or "missing"})'
+
+    evidence = action.get("evidence")
+    if not isinstance(evidence, list):
+        return False, "missing evidence list"
+
+    evidence_items = [str(item).strip() for item in evidence if str(item).strip()]
+    if len(evidence_items) < 2:
+        return False, "need at least 2 evidence items"
+
+    return True, "ok"
+
+
+def _build_directions(trajectory: list[dict]) -> list[str]:
+    """Build human-readable step-by-step directions from the trajectory."""
+    if len(trajectory) < 2:
+        return ["You are already at the destination."]
+
+    YAW_NAMES = {0: "north (+x)", 90: "east (+y)", 180: "south (-x)", 270: "west (-y)"}
+
+    directions = []
+    prev = trajectory[0]
+    facing = int(round(prev["yaw"])) % 360
+    facing_name = YAW_NAMES.get(facing, f"{facing} deg")
+    directions.append(f"Start at ({prev['x']:.1f}, {prev['y']:.1f}, {prev['z']:.1f}) facing {facing_name}.")
+
+    i = 1
+    while i < len(trajectory):
+        curr = trajectory[i]
+        dx = curr["x"] - prev["x"]
+        dy = curr["y"] - prev["y"]
+        dyaw = (curr["yaw"] - prev["yaw"]) % 360
+
+        parts = []
+        if dyaw == 90:
+            parts.append("turn right")
+        elif dyaw == 270:
+            parts.append("turn left")
+        elif dyaw == 180:
+            parts.append("turn around")
+
+        dist = math.sqrt(dx**2 + dy**2)
+        if dist > 0.05:
+            # Count consecutive forward moves
             count = 1
             while i + count < len(trajectory):
-                next_move = _describe_move(trajectory[i + count - 1], trajectory[i + count])
-                if next_move == move:
+                nxt = trajectory[i + count]
+                ndx = nxt["x"] - trajectory[i + count - 1]["x"]
+                ndy = nxt["y"] - trajectory[i + count - 1]["y"]
+                ndyaw = (nxt["yaw"] - trajectory[i + count - 1]["yaw"]) % 360
+                if ndyaw == 0 and math.sqrt(ndx**2 + ndy**2) > 0.05:
                     count += 1
                 else:
                     break
+            if count > 1:
+                parts.append(f"walk forward {count} steps")
+                i += count - 1
+            else:
+                parts.append("walk forward")
 
-            if "walk forward" in move and count > 1:
-                move = move.replace("walk forward", f"walk forward {count} steps")
+        if parts:
+            directions.append(f"{len(directions)}. {' then '.join(parts).capitalize()}.")
+        prev = trajectory[i]
+        i += 1
 
-            directions.append(f"{len(directions)}. {move.capitalize()}.")
-            prev = trajectory[i + count - 1]
-            i += count
-
-        return directions
-
-    @staticmethod
-    def _parse_action(text: str) -> dict | None:
-        """Best-effort JSON extraction from LLM output."""
-        # Strip markdown fences if present
-        if "```" in text:
-            parts = text.split("```")
-            if len(parts) >= 2:
-                text = parts[1]
-                if text.startswith("json"):
-                    text = text[4:]
-        # Try to find JSON object boundaries
-        start = text.find("{")
-        end = text.rfind("}")
-        if start == -1 or end == -1 or end <= start:
-            return None
-        try:
-            return json.loads(text[start : end + 1])
-        except json.JSONDecodeError:
-            return None
-
-    @staticmethod
-    def _validate_found_action(action: dict) -> tuple[bool, str]:
-        """Require high-confidence structured evidence before accepting found."""
-        desc = str(action.get("description", "")).strip()
-        if not desc:
-            return False, "missing description"
-
-        confidence = str(action.get("confidence", "")).strip().lower()
-        if confidence != "high":
-            return False, f'confidence must be "high" (got {confidence or "missing"})'
-
-        evidence = action.get("evidence")
-        if not isinstance(evidence, list):
-            return False, "missing evidence list"
-
-        evidence_items = [str(item).strip() for item in evidence if str(item).strip()]
-        if len(evidence_items) < 2:
-            return False, "need at least 2 evidence items"
-
-        return True, "ok"
+    return directions
 
 
 # ---------------------------------------------------------------------------
-# spawn_agent – Modal function that runs a single agent
+# spawn_agent
 # ---------------------------------------------------------------------------
 
 
-@app.function(image=agent_image, gpu="H200", volumes={MODEL_DIR: model_vol}, timeout=600)
+@vision_app.function(image=agent_image, gpu="H200", volumes={MODEL_DIR: model_vol}, timeout=600)
 def spawn_agent(
     query: str,
     x: float,
@@ -648,15 +722,8 @@ def spawn_agent(
     agent_id: int,
     session_key: str,
 ) -> dict:
-    """Run a single exploration agent as a standalone Modal function.
-
-    This is the unit of parallelism — call .spawn() N times from main()
-    to search concurrently.
-
-    Returns dict with keys:
-        found, agent_id, description, final_image_b64, steps, trajectory
-    """
-    runner = AgentRunner()
+    """Run a single exploration agent as a standalone Modal function."""
+    runner = VisionAgent()
     return runner.send_agent.remote(
         query=query,
         start_x=x, start_y=y, start_z=z,
@@ -671,7 +738,7 @@ def spawn_agent(
 # ---------------------------------------------------------------------------
 
 
-@app.function(image=agent_image, timeout=600)
+@vision_app.function(image=agent_image, timeout=600)
 @modal.fastapi_endpoint(method="POST")
 def stream_agents(request: dict):
     """SSE endpoint for streaming agent exploration to the frontend."""
@@ -686,11 +753,14 @@ def stream_agents(request: dict):
         session_key = str(uuid.uuid4())
         cancel_dict[session_key] = False
 
-        # Emit agent_started events
+        # Compute diverse starting yaws for agents
         agent_configs = []
         for i in range(num_agents):
-            agent_yaw = (start_yaw + (i % 2) * 180) % 360
-            agent_configs.append((i, agent_yaw))
+            if num_agents <= 2:
+                agent_yaw = (start_yaw + i * 180) % 360
+            else:
+                agent_yaw = (start_yaw + i * (360 // num_agents)) % 360
+            agent_configs.append((i, _snap_yaw(agent_yaw)))
             event = {
                 "type": "agent_started",
                 "agent_id": i,
@@ -699,7 +769,7 @@ def stream_agents(request: dict):
             yield f"data: {json.dumps(event)}\n\n"
 
         # Spawn agents and poll for completion
-        runner = AgentRunner()
+        runner = VisionAgent()
         handles = []
         for agent_id, agent_yaw in agent_configs:
             h = runner.send_agent.spawn(
@@ -808,7 +878,7 @@ def stream_agents(request: dict):
     )
 
 
-@app.function(image=agent_image)
+@vision_app.function(image=agent_image)
 @modal.fastapi_endpoint(method="OPTIONS")
 def stream_agents_options():
     """Handle CORS preflight requests for the streaming endpoint."""
@@ -823,11 +893,11 @@ def stream_agents_options():
 
 
 # ---------------------------------------------------------------------------
-# Local entrypoint – launches N agents in parallel, first success wins
+# Local entrypoint
 # ---------------------------------------------------------------------------
 
 
-@app.local_entrypoint()
+@vision_app.local_entrypoint()
 def main(
     query: str = "find the nearest bathroom",
     x: float = 0.0,
@@ -850,10 +920,14 @@ def main(
     print(f"# session={session_key}")
     print(f"{'#'*60}\n")
 
-    # Spawn N agents with different starting yaw offsets
+    # Spawn N agents with diverse starting yaws
     handles = []
     for i in range(n):
-        agent_yaw = (yaw + (i % 2) * 180) % 360
+        if n <= 2:
+            agent_yaw = (yaw + i * 180) % 360
+        else:
+            agent_yaw = (yaw + i * (360 // n)) % 360
+        agent_yaw = _snap_yaw(agent_yaw)
         print(f"Spawning agent {i}  yaw={agent_yaw:.1f}")
         h = spawn_agent.spawn(
             query=query,
@@ -891,9 +965,8 @@ def main(
 
             if r["found"] and winner is None:
                 winner = r
-                # Signal all other agents to stop
                 cancel_dict[session_key] = True
-                print(f"\n>>> Agent {i} found the target – cancelling others <<<\n")
+                print(f"\n>>> Agent {i} found the target - cancelling others <<<\n")
 
     # Cleanup
     try:
@@ -920,8 +993,6 @@ def main(
         if final.get("filename"):
             print(f"  filename: {final['filename']}")
         print(f"  trajectory points: {len(final['trajectory'])}")
-        if final["final_image_b64"]:
-            print(f"  final image: {len(final['final_image_b64'])} chars base64")
         if final.get("directions"):
             print(f"\n  Directions:")
             for d in final["directions"]:
