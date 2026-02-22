@@ -61,7 +61,7 @@ YOLO_INPUT_SIZE = 640  # YOLOv8 expects 640x640
 # --- NPU ---
 # Update this path after checking the laptop. Run: dir C:\Qualcomm
 # Browse to: C:\Qualcomm\AIStack\QAIRT\<version>\lib\arm64x-windows-msvc\
-QNN_DLL_PATH = r"C:\Qualcomm\AIStack\QAIRT\2.26.0.240828\lib\arm64x-windows-msvc\QnnHtp.dll"
+QNN_DLL_PATH = r"C:\Users\hackathon user\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\LocalCache\local-packages\Python312\site-packages\onnxruntime\capi\QnnHtp.dll"
 
 # --- LLM ---
 LLM_MODEL = "phi3:mini"

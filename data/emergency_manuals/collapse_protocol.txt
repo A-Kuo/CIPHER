@@ -1,0 +1,7 @@
+Building collapse search and rescue procedures.
+
+Before entry: Structural assessment by qualified person. Identify load-bearing walls and collapse zones. Check for secondary collapse risk, gas, electrical hazards. Establish communication protocol (hand signals, radio) and backup. Never enter alone; buddy system required.
+
+Victim location: Use systematic search (grid or quadrant). Listen for tapping, voice, use acoustic sensors if available. Mark searched areas. Document locations for rescue teams. Use canines if available for live scent.
+
+Structural assessment: Crack classification — hairline (monitor), moderate (restrict access), severe (evacuate). Assess foundation movement, leaning walls, hanging loads. When in doubt, do not enter. Communicate findings to incident command.

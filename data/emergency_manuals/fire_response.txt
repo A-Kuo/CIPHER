@@ -1,0 +1,7 @@
+Fire behavior in structures and safe entry.
+
+Fire behavior: Compartment fires — growth, flashover risk, backdraft in under-ventilated spaces. Smoke movement — rises, then banks down; stay low. Identify flow path (air in vs out).
+
+Safe entry conditions: Enter only when IC approves. Full PPE and SCBA. Check door temperature; if hot, do not open. Vent before entry when possible. Maintain egress path. Do not commit beyond point of no return.
+
+Suppression priorities: Life safety first. Protect egress. Contain spread. Coordinate with fire service. In wildfire-affected structures, check for smoldering and hotspots before re-entry.

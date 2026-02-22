@@ -1,0 +1,7 @@
+Survivor extraction procedures.
+
+Triage: Use START (Simple Triage and Rapid Treatment). RPM — Respiration, Perfusion, Mental status. Priority order: Immediate (red), Delayed (yellow), Minor (green), Deceased (black). Allocate resources to Immediate first; do not spend time on deceased.
+
+Extraction: Stabilize spine if mechanism suggests injury. Use minimal movement. Create space (cribbing, lifting) rather than pulling. Protect airway during move. Document condition before and after move.
+
+Medical: Control hemorrhage, maintain airway, treat for shock. Coordinate with EMS for handoff. Team coordination: one team leader, clear roles (extraction, medical, safety).

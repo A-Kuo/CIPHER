@@ -6,12 +6,13 @@ $root = $PSScriptRoot
 # Prefer real Python installs; "python" on Windows is often the Store stub that says "Python was not found"
 $pythonExe = $null
 foreach ($p in @(
-    "C:\env\Scripts\python.exe",
+    "$env:LOCALAPPDATA\Microsoft\WindowsApps\python3.12.exe",
     "$env:LOCALAPPDATA\Programs\Python\Python312\python.exe",
     "$env:LOCALAPPDATA\Programs\Python\Python311\python.exe",
     "$env:LOCALAPPDATA\Programs\Python\Python313\python.exe",
     "$env:ProgramFiles\Python312\python.exe",
-    "$env:ProgramFiles\Python311\python.exe"
+    "$env:ProgramFiles\Python311\python.exe",
+    "C:\env\Scripts\python.exe"
 )) {
     if (Test-Path $p) { $pythonExe = $p; break }
 }

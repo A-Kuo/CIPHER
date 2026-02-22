@@ -1,0 +1,7 @@
+START triage system and resource allocation.
+
+START: 30-second assessment per victim. Respiration: >30/min → Immediate. <30 → check perfusion. Perfusion: Cap refill >2s or no radial pulse → Immediate. Mental status: Cannot follow simple commands → Immediate. Otherwise tag Delayed (yellow) or Minor (green).
+
+Priority classifications: Immediate (red) — need treatment and transport within minutes. Delayed (yellow) — need care within hours. Minor (green) — walking wounded, treat last. Deceased (black) — no spontaneous respiration after airway open; do not allocate resources.
+
+Resource allocation: By survivor count and condition. One critical victim — focus resources. Many critical — prioritize salvageable. Document triage tags and hand off to EMS.

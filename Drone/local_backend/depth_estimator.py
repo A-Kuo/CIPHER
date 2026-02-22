@@ -63,12 +63,17 @@ class DepthEstimator:
         try:
             opts = ort.SessionOptions()
             opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-            providers = ["QNNExecutionProvider", "CPUExecutionProvider"]
             available = ort.get_available_providers()
-            session_providers = [p for p in providers if p in available] or ["CPUExecutionProvider"]
-            self._session = ort.InferenceSession(str(QUALCOMM_ONNX_PATH), opts, providers=session_providers)
+            # Find QnnHtp.dll bundled with onnxruntime (works without Qualcomm SDK installed)
+            qnn_dll = Path(ort.__file__).parent / "capi" / "QnnHtp.dll"
+            prov_list: list = []
+            if "QNNExecutionProvider" in available and qnn_dll.exists():
+                prov_list.append(("QNNExecutionProvider", {"backend_path": str(qnn_dll)}))
+            prov_list.append("CPUExecutionProvider")
+            self._session = ort.InferenceSession(str(QUALCOMM_ONNX_PATH), opts, providers=prov_list)
             self._backend = "qualcomm_onnx"
-            print(f"  Depth: Depth Anything V2 ONNX on {session_providers[0]}")
+            active = self._session.get_providers()
+            print(f"  Depth: Depth Anything V2 ONNX on {active[0]}")
             return True
         except Exception as e:
             logger.warning(f"  Depth: Qualcomm ONNX load failed — {e}")

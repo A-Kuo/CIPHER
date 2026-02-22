@@ -1,0 +1,7 @@
+Structural hazard classification and risk levels.
+
+Crack types: Hairline — often cosmetic; monitor. Moderate — width >3mm or progressive; restrict access, engineer assessment. Severe — significant width, displacement, or active; evacuate area.
+
+Risk levels: LOW — minor damage, no load-bearing compromise; proceed with caution. MEDIUM — localized damage, possible load path change; limit occupancy, brief entries only. HIGH — significant damage, collapse potential; evacuate, no entry except rescue with shoring.
+
+When to evacuate: Unstable facade, falling debris, gas leak, fire spread, or when structural engineer recommends. When to proceed: Low risk, clear objective, PPE, buddy system, and incident command approval.
